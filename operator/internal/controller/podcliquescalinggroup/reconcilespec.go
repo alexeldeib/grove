@@ -73,8 +73,25 @@ func (r *Reconciler) processRollingUpdate(ctx context.Context, logger logr.Logge
 	if err != nil {
 		return ctrlcommon.ReconcileWithErrors(fmt.Sprintf("could not get owner PodCliqueSet for PodCliqueScalingGroup: %v", pcsgObjectKey), err)
 	}
+
+	// If the PCS is not actively updating this PCSG's replica, but the PCSG still has
+	// stale rolling update progress from a previous/superseded update, clear it.
+	// This prevents the PCSG from being stuck in an "in-flight" state when a
+	// consecutive update causes the PCS to skip past this PCSG's update.
 	if pcs.Status.RollingUpdateProgress == nil || pcs.Status.RollingUpdateProgress.CurrentlyUpdating == nil {
-		// No update has yet been triggered for the PodCliqueSet. Nothing to do here.
+		if pcsg.Status.RollingUpdateProgress != nil && pcsg.Status.RollingUpdateProgress.UpdateEndedAt == nil &&
+			pcs.Status.CurrentGenerationHash != nil &&
+			pcsg.Status.RollingUpdateProgress.PodCliqueSetGenerationHash != *pcs.Status.CurrentGenerationHash {
+			logger.Info("Clearing stale PCSG rolling update progress from superseded update",
+				"stalePCSGHash", pcsg.Status.RollingUpdateProgress.PodCliqueSetGenerationHash,
+				"currentPCSHash", *pcs.Status.CurrentGenerationHash)
+			pcsg.Status.RollingUpdateProgress.UpdateEndedAt = &metav1.Time{Time: metav1.Now().Time}
+			pcsg.Status.RollingUpdateProgress.ReadyReplicaIndicesSelectedToUpdate = nil
+			if err = r.client.Status().Update(ctx, pcsg); err != nil {
+				logger.Error(err, "could not clear stale PodCliqueScalingGroup rolling update progress")
+				return ctrlcommon.ReconcileWithErrors(fmt.Sprintf("could not clear stale rolling update progress for PodCliqueScalingGroup: %v", pcsgObjectKey), err)
+			}
+		}
 		return ctrlcommon.ContinueReconcile()
 	}
 	pcsReplicaInUpdating := pcs.Status.RollingUpdateProgress.CurrentlyUpdating.ReplicaIndex
