@@ -68,6 +68,10 @@ type PodCliqueScalingGroupSpec struct {
 	// CliqueNames is the list of PodClique names that are configured in the
 	// matching PodCliqueScalingGroup in PodCliqueSet.Spec.Template.PodCliqueScalingGroupConfigs.
 	CliqueNames []string `json:"cliqueNames"`
+	// UpdateStrategy defines the strategy for rolling updates of the PodCliqueScalingGroup.
+	// Propagated from PodCliqueScalingGroupConfig in the PodCliqueSet spec.
+	// +optional
+	UpdateStrategy *PCSGUpdateStrategy `json:"updateStrategy,omitempty"`
 }
 
 // PodCliqueScalingGroupStatus is the status of the PodCliqueScalingGroup.

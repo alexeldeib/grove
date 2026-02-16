@@ -40,6 +40,10 @@ type updateWork struct {
 	oldPendingReplicaIndices     []int
 	oldUnavailableReplicaIndices []int
 	oldReadyReplicaIndices       []int
+	// updatedReplicaCount tracks how many replicas already match the expected generation.
+	// Used together with oldReady/oldPending/oldUnavailable counts to compute how many
+	// replicas are currently "in-flight" (deleted/recreating but not yet updated).
+	updatedReplicaCount int
 }
 
 type replicaState int
@@ -65,19 +69,29 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 		return err
 	}
 
-	// Check if there is currently a replica that is selected for update and its update has not yet completed.
-	if isAnyReadyReplicaSelectedForUpdate(sc.pcsg) && !isCurrentReplicaUpdateComplete(sc) {
+	maxUnavail := resolveMaxUnavailable(sc.pcsg)
+
+	// Compute how many replicas are currently "in-flight" (deleted/recreating but not yet updated).
+	// Total replicas minus old (pending+unavailable+ready) minus already updated = in-flight.
+	oldCount := len(work.oldPendingReplicaIndices) + len(work.oldUnavailableReplicaIndices) + len(work.oldReadyReplicaIndices)
+	inFlight := int(sc.pcsg.Spec.Replicas) - oldCount - work.updatedReplicaCount
+
+	// If maxUnavailable replicas are already in-flight, wait for them to complete.
+	if inFlight > 0 && inFlight >= maxUnavail {
 		return groveerr.New(
 			groveerr.ErrCodeContinueReconcileAndRequeue,
 			component.OperationSync,
-			fmt.Sprintf("rolling update of currently selected PCSG replica index: %d is not complete, requeuing", sc.pcsg.Status.RollingUpdateProgress.ReadyReplicaIndicesSelectedToUpdate.Current),
+			fmt.Sprintf("maxUnavailable reached: %d replicas in-flight (max %d), requeuing", inFlight, maxUnavail),
 		)
 	}
 
-	// Either the update has not started, or a previously selected replica has been successfully updated.
-	// Either of the cases requires selecting the next replica index to update.
-	var nextReplicaIndexToUpdate *int
-	if len(work.oldReadyReplicaIndices) > 0 {
+	// Select up to (maxUnavailable - inFlight) more old ready replicas to update.
+	canUpdate := maxUnavail - inFlight
+	if canUpdate > len(work.oldReadyReplicaIndices) {
+		canUpdate = len(work.oldReadyReplicaIndices)
+	}
+
+	if canUpdate > 0 {
 		if sc.pcsg.Status.AvailableReplicas < *sc.pcsg.Spec.MinAvailable {
 			return groveerr.New(
 				groveerr.ErrCodeContinueReconcileAndRequeue,
@@ -85,27 +99,38 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 				fmt.Sprintf("available replicas %d lesser than minAvailable %d, requeuing", sc.pcsg.Status.AvailableReplicas, *sc.pcsg.Spec.MinAvailable),
 			)
 		}
-		nextReplicaIndexToUpdate = ptr.To(work.oldReadyReplicaIndices[0])
-	}
 
-	// Trigger the update if there is an index still pending an update.
-	if nextReplicaIndexToUpdate != nil {
-		logger.Info("Selected the next replica to update", "nextReplicaIndexToUpdate", *nextReplicaIndexToUpdate)
-		if err := r.updatePCSGStatusWithNextReplicaToUpdate(sc.ctx, logger, sc.pcsg, *nextReplicaIndexToUpdate); err != nil {
+		replicaIndicesToUpdate := work.oldReadyReplicaIndices[:canUpdate]
+		logger.Info("Selected replicas to update", "replicaIndices", replicaIndicesToUpdate, "maxUnavailable", maxUnavail)
+
+		for _, idx := range replicaIndicesToUpdate {
+			if err := r.updatePCSGStatusWithNextReplicaToUpdate(sc.ctx, logger, sc.pcsg, idx); err != nil {
+				return err
+			}
+		}
+
+		// Trigger deletion of all selected replica indices at once.
+		replicaIndexStrs := lo.Map(replicaIndicesToUpdate, func(idx int, _ int) string {
+			return strconv.Itoa(idx)
+		})
+		deleteTasks := r.createDeleteTasks(logger, sc.pcs, sc.pcsg.Name, replicaIndexStrs, "deleting replicas for rolling update")
+		if err := r.triggerDeletionOfPodCliques(sc.ctx, logger, client.ObjectKeyFromObject(sc.pcsg), deleteTasks); err != nil {
 			return err
 		}
 
-		// Trigger deletion of the next replica index.
-		deleteTask := r.createDeleteTasks(logger, sc.pcs, sc.pcsg.Name, []string{strconv.Itoa(*nextReplicaIndexToUpdate)}, "deleting replica for rolling update")
-		if err := r.triggerDeletionOfPodCliques(sc.ctx, logger, client.ObjectKeyFromObject(sc.pcsg), deleteTask); err != nil {
-			return err
-		}
-
-		// Requeue to re-create the deleted PodCliques of the replica.
 		return groveerr.New(
 			groveerr.ErrCodeContinueReconcileAndRequeue,
 			component.OperationSync,
-			fmt.Sprintf("rolling update of currently selected PCSG replica index: %d is not complete, requeuing", sc.pcsg.Status.RollingUpdateProgress.ReadyReplicaIndicesSelectedToUpdate.Current),
+			fmt.Sprintf("started rolling update of %d PCSG replicas, requeuing", len(replicaIndicesToUpdate)),
+		)
+	}
+
+	// No old replicas remaining. If still waiting for in-flight replicas, requeue.
+	if inFlight > 0 {
+		return groveerr.New(
+			groveerr.ErrCodeContinueReconcileAndRequeue,
+			component.OperationSync,
+			fmt.Sprintf("waiting for %d in-flight replicas to complete update, requeuing", inFlight),
 		)
 	}
 
@@ -154,11 +179,13 @@ func (r _resource) markRollingUpdateEnd(ctx context.Context, logger logr.Logger,
 	return nil
 }
 
-// computePendingUpdateWork analyzes existing replicas and categorizes them by update status and availability state
+// computePendingUpdateWork analyzes existing replicas and categorizes them by update status and availability state.
+// During rolling updates with maxSurge > 0, also iterates over surge replica indices.
 func computePendingUpdateWork(sc *syncContext) (*updateWork, error) {
 	work := &updateWork{}
 	existingPCLQsByReplicaIndex := componentutils.GroupPCLQsByPCSGReplicaIndex(sc.existingPCLQs)
-	for pcsgReplicaIndex := range int(sc.pcsg.Spec.Replicas) {
+	effectiveReplicas := int(sc.pcsg.Spec.Replicas) + resolveMaxSurge(sc.pcsg)
+	for pcsgReplicaIndex := range effectiveReplicas {
 		pcsgReplicaIndexStr := strconv.Itoa(pcsgReplicaIndex)
 		existingPCSGReplicaPCLQs := existingPCLQsByReplicaIndex[pcsgReplicaIndexStr]
 		if isReplicaDeletedOrMarkedForDeletion(sc.pcsg, existingPCSGReplicaPCLQs, pcsgReplicaIndex) {
@@ -174,6 +201,7 @@ func computePendingUpdateWork(sc *syncContext) (*updateWork, error) {
 			return nil, err
 		}
 		if isUpdated {
+			work.updatedReplicaCount++
 			continue
 		}
 		state := getReplicaState(existingPCSGReplicaPCLQs)

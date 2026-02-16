@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // +genclient
@@ -232,6 +233,33 @@ type PodCliqueScalingGroupConfig struct {
 	// Must be equal to or stricter than parent PodCliqueSet constraints.
 	// +optional
 	TopologyConstraint *TopologyConstraint `json:"topologyConstraint,omitempty"`
+	// UpdateStrategy defines the strategy for rolling updates of the PodCliqueScalingGroup.
+	// +optional
+	UpdateStrategy *PCSGUpdateStrategy `json:"updateStrategy,omitempty"`
+}
+
+// PCSGUpdateStrategy defines the strategy for updating PodCliqueScalingGroup replicas.
+type PCSGUpdateStrategy struct {
+	// RollingUpdate controls rolling update behavior.
+	// +optional
+	RollingUpdate *PCSGRollingUpdateStrategy `json:"rollingUpdate,omitempty"`
+}
+
+// PCSGRollingUpdateStrategy controls the rolling update behavior of a PodCliqueScalingGroup.
+type PCSGRollingUpdateStrategy struct {
+	// MaxUnavailable is the maximum number of replicas that can be unavailable
+	// during a rolling update. Value can be an absolute number (e.g., 2) or a
+	// percentage of total replicas (e.g., "50%"). Defaults to 1.
+	// Cannot be 0 if MaxSurge is 0.
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+	// MaxSurge is the maximum number of extra replicas created above spec.replicas
+	// during a rolling update. Surge replicas run the new spec and serve traffic
+	// while old replicas are replaced. Value can be an absolute number (e.g., 2) or
+	// a percentage of total replicas (e.g., "50%"). Defaults to 0.
+	// Cannot be 0 if MaxUnavailable is 0.
+	// +optional
+	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
 }
 
 // HeadlessServiceConfig defines the config options for the headless service.

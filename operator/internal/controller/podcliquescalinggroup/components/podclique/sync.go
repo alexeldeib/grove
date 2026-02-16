@@ -126,11 +126,18 @@ func (r _resource) runSyncFlow(logger logr.Logger, sc *syncContext) error {
 	return nil
 }
 
-// triggerDeletionOfExcessPCSGReplicas removes PCSG replicas that exceed the desired replica count due to scale-down
+// triggerDeletionOfExcessPCSGReplicas removes PCSG replicas that exceed the desired replica count due to scale-down.
+// During rolling updates with maxSurge > 0, the effective replica count is temporarily increased to allow
+// surge replicas. Surge replicas are cleaned up when the rolling update ends.
 func (r _resource) triggerDeletionOfExcessPCSGReplicas(logger logr.Logger, sc *syncContext) error {
 	existingPCSGReplicas := getExistingNonTerminatingPCSGReplicas(sc.existingPCLQs)
+	// During rolling updates with maxSurge, allow extra replicas.
+	effectiveReplicas := int(sc.pcsg.Spec.Replicas)
+	if componentutils.IsPCSGUpdateInProgress(sc.pcsg) {
+		effectiveReplicas += resolveMaxSurge(sc.pcsg)
+	}
 	// Check if the number of existing PodCliques is greater than expected, if so, we need to delete the extra ones.
-	diff := existingPCSGReplicas - int(sc.pcsg.Spec.Replicas)
+	diff := existingPCSGReplicas - effectiveReplicas
 	if diff > 0 {
 		pcsgObjectKey := client.ObjectKeyFromObject(sc.pcsg)
 		logger.Info("Found more PodCliques than expected, triggering deletion of excess PodCliques", "expected", int(sc.pcsg.Spec.Replicas), "existing", existingPCSGReplicas, "diff", diff)
@@ -248,13 +255,17 @@ func getMinAvailableBreachedPCSGIndices(logger logr.Logger, existingPCLQs []grov
 }
 
 // getExpectedPodCliqueFQNsByPCSGReplica computes expected PCLQ names per expected PCSG replica.
-// It returns a map with the key being the PCSG replica index and the value is the expected PCLQ FQNs for that replica. In addition
-// it also returns the total number of expected PCLQs.
+// It returns a map with the key being the PCSG replica index and the value is the expected PCLQ FQNs for that replica.
+// During rolling updates with maxSurge > 0, additional surge replicas are created beyond spec.Replicas.
 func getExpectedPodCliqueFQNsByPCSGReplica(pcsg *grovecorev1alpha1.PodCliqueScalingGroup) map[int][]string {
 	var (
 		expectedPCLQFQNs = make(map[int][]string)
 	)
-	for pcsgReplicaIndex := range int(pcsg.Spec.Replicas) {
+	effectiveReplicas := int(pcsg.Spec.Replicas)
+	if componentutils.IsPCSGUpdateInProgress(pcsg) {
+		effectiveReplicas += resolveMaxSurge(pcsg)
+	}
+	for pcsgReplicaIndex := range effectiveReplicas {
 		pclqFQNs := lo.Map(pcsg.Spec.CliqueNames, func(cliqueName string, _ int) string {
 			return apicommon.GeneratePodCliqueName(apicommon.ResourceNameReplica{
 				Name:    pcsg.Name,
