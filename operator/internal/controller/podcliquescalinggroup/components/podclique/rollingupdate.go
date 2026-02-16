@@ -146,7 +146,17 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 		)
 	}
 
-	return r.markRollingUpdateEnd(sc.ctx, logger, sc.pcsg)
+	if err := r.markRollingUpdateEnd(sc.ctx, logger, sc.pcsg); err != nil {
+		return err
+	}
+	// Requeue so the next reconcile cycle cleans up surge replicas
+	// (triggerDeletionOfExcessPCSGReplicas runs before processPendingUpdates,
+	// so it couldn't see the update had ended during this cycle).
+	return groveerr.New(
+		groveerr.ErrCodeContinueReconcileAndRequeue,
+		component.OperationSync,
+		"rolling update ended, requeuing to clean up surge replicas",
+	)
 }
 
 // updatePCSGStatusWithNextReplicaToUpdate marks the next replica index as selected for rolling update in the PCSG status

@@ -149,8 +149,12 @@ func GetPCLQsInPCSGPendingUpdate(pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grov
 	pclqFQNsPendingUpdate := make([]string, 0, len(existingPCLQs))
 	expectedPCLQPodTemplateHashes := GetPCLQTemplateHashes(pcs, pcsg)
 	for _, existingPCLQ := range existingPCLQs {
+		expectedPodTemplateHash, ok := expectedPCLQPodTemplateHashes[existingPCLQ.Name]
+		if !ok {
+			// PCLQ not in expected set (e.g., surge replica being cleaned up); skip.
+			continue
+		}
 		existingPodTemplateHash := existingPCLQ.Labels[apicommon.LabelPodTemplateHash]
-		expectedPodTemplateHash := expectedPCLQPodTemplateHashes[existingPCLQ.Name]
 		if existingPodTemplateHash != expectedPodTemplateHash {
 			pclqFQNsPendingUpdate = append(pclqFQNsPendingUpdate, expectedPodTemplateHash)
 		}
