@@ -203,9 +203,14 @@ func computePendingUpdateWork(sc *syncContext) (*updateWork, error) {
 		if isReplicaDeletedOrMarkedForDeletion(sc.pcsg, existingPCSGReplicaPCLQs, pcsgReplicaIndex) {
 			continue
 		}
-		// pcsgReplicaIndex is the currently updating replica
+		// If this replica was selected for update, check whether the update has completed.
+		// If updated and ready, count it; otherwise leave it as in-flight (not counted anywhere).
 		if sc.pcsg.Status.RollingUpdateProgress.ReadyReplicaIndicesSelectedToUpdate != nil &&
 			sc.pcsg.Status.RollingUpdateProgress.ReadyReplicaIndicesSelectedToUpdate.Current == int32(pcsgReplicaIndex) {
+			isUpdated, err := isReplicaUpdated(sc.expectedPCLQPodTemplateHashMap, existingPCSGReplicaPCLQs)
+			if err == nil && isUpdated && getReplicaState(existingPCSGReplicaPCLQs) == replicaStateReady {
+				work.updatedReplicaCount++
+			}
 			continue
 		}
 		isUpdated, err := isReplicaUpdated(sc.expectedPCLQPodTemplateHashMap, existingPCSGReplicaPCLQs)
