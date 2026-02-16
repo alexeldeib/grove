@@ -30,6 +30,7 @@ import (
 	"github.com/ai-dynamo/grove/operator/internal/controller/common/component"
 	componentutils "github.com/ai-dynamo/grove/operator/internal/controller/common/component/utils"
 	ctrlutils "github.com/ai-dynamo/grove/operator/internal/controller/utils"
+	"github.com/ai-dynamo/grove/operator/internal/expect"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -88,7 +89,7 @@ func (r *Reconciler) processRollingUpdate(ctx context.Context, logger logr.Logge
 
 	if shouldResetOrTriggerRollingUpdate(pcs, pclq) {
 		logger.Info("PodCliqueSet has a new generation hash. Initializing or resetting rolling update for PodClique", "PodCliqueSetGenerationHash", *pcs.Status.CurrentGenerationHash, "CurrentPodCliqueSetGenerationHash", pclq.Status.CurrentPodCliqueSetGenerationHash, "isPCLQUpdateInProgress", componentutils.IsPCLQUpdateInProgress(pclq), "isLastPCLQUpdateCompleted", componentutils.IsLastPCLQUpdateCompleted(pclq))
-		if err = r.initOrResetRollingUpdate(ctx, pcs, pclq); err != nil {
+		if err = r.initOrResetRollingUpdate(ctx, logger, pcs, pclq); err != nil {
 			return ctrlcommon.ReconcileWithErrors("could not initialize rolling update", err)
 		}
 	}
@@ -146,11 +147,24 @@ func shouldResetOrTriggerRollingUpdate(pcs *grovecorev1alpha1.PodCliqueSet, pclq
 }
 
 // initOrResetRollingUpdate initializes or resets the rolling update progress status for the PodClique
-func (r *Reconciler) initOrResetRollingUpdate(ctx context.Context, pcs *grovecorev1alpha1.PodCliqueSet, pclq *grovecorev1alpha1.PodClique) error {
+func (r *Reconciler) initOrResetRollingUpdate(ctx context.Context, logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, pclq *grovecorev1alpha1.PodClique) error {
 	podTemplateHash, err := componentutils.GetExpectedPCLQPodTemplateHash(pcs, pclq.ObjectMeta)
 	if err != nil {
 		return fmt.Errorf("could not update PodClique %s status with rolling update progress: %w", client.ObjectKeyFromObject(pclq), err)
 	}
+
+	// Clear stale expectations from any previous rolling update.
+	// Without this, a consecutive update (update B triggered while update A is in progress) may
+	// see stale deletion expectations from update A and skip pods that need updating, causing the
+	// new update to get permanently stuck.
+	controlleeKey, err := expect.ControlleeKeyFunc(pclq)
+	if err != nil {
+		return fmt.Errorf("could not compute expectations key for PodClique %s: %w", client.ObjectKeyFromObject(pclq), err)
+	}
+	if err = r.expectationsStore.DeleteExpectations(logger, controlleeKey); err != nil {
+		return fmt.Errorf("could not clear expectations for PodClique %s: %w", client.ObjectKeyFromObject(pclq), err)
+	}
+
 	// reset and start the rolling update
 	patch := client.MergeFrom(pclq.DeepCopy())
 	pclq.Status.RollingUpdateProgress = &grovecorev1alpha1.PodCliqueRollingUpdateProgress{
