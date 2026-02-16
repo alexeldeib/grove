@@ -90,11 +90,24 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, logger logr.Logger, pc
 
 // mutateCurrentHashes updates the PodClique's current template and generation hashes when updates are complete
 func mutateCurrentHashes(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, pclq *grovecorev1alpha1.PodClique) error {
-	if componentutils.IsPCLQUpdateInProgress(pclq) || pclq.Status.UpdatedReplicas != pclq.Status.Replicas {
+	// If an update is actively in progress (started but not ended), do not advance hashes yet.
+	if componentutils.IsPCLQUpdateInProgress(pclq) {
 		logger.Info("PodClique is currently updating, cannot set PodCliqueSet CurrentGenerationHash yet")
 		return nil
 	}
-	if pclq.Status.RollingUpdateProgress == nil {
+	// If the update has completed (UpdateEndedAt is set), advance hashes unconditionally.
+	// We must NOT gate on UpdatedReplicas == Replicas here because UpdatedReplicas may
+	// temporarily lag behind Replicas while new pods are starting. Blocking hash advancement
+	// on this condition creates a deadlock: the PCSG waits for the hash to advance, but
+	// mutateUpdatedReplica needs the pods to be labeled and running first.
+	if pclq.Status.RollingUpdateProgress != nil && componentutils.IsLastPCLQUpdateCompleted(pclq) {
+		logger.Info("PodClique update has completed, setting CurrentPodCliqueSetGenerationHash")
+		pclq.Status.CurrentPodTemplateHash = ptr.To(pclq.Status.RollingUpdateProgress.PodTemplateHash)
+		pclq.Status.CurrentPodCliqueSetGenerationHash = ptr.To(pclq.Status.RollingUpdateProgress.PodCliqueSetGenerationHash)
+		return nil
+	}
+	// No update in progress or completed — steady state.
+	if pclq.Status.RollingUpdateProgress == nil && pclq.Status.UpdatedReplicas == pclq.Status.Replicas {
 		expectedPodTemplateHash, err := componentutils.GetExpectedPCLQPodTemplateHash(pcs, pclq.ObjectMeta)
 		if err != nil {
 			return err
@@ -103,10 +116,6 @@ func mutateCurrentHashes(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet
 			pclq.Status.CurrentPodTemplateHash = ptr.To(expectedPodTemplateHash)
 			pclq.Status.CurrentPodCliqueSetGenerationHash = pcs.Status.CurrentGenerationHash
 		}
-	} else if componentutils.IsLastPCLQUpdateCompleted(pclq) {
-		logger.Info("PodClique update has completed, setting CurrentPodCliqueSetGenerationHash")
-		pclq.Status.CurrentPodTemplateHash = ptr.To(pclq.Status.RollingUpdateProgress.PodTemplateHash)
-		pclq.Status.CurrentPodCliqueSetGenerationHash = ptr.To(pclq.Status.RollingUpdateProgress.PodCliqueSetGenerationHash)
 	}
 	return nil
 }

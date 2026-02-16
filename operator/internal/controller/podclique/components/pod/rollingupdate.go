@@ -128,7 +128,19 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 		)
 	}
 
-	// If the control comes here, then mark the end of update.
+	// Verify that enough new pods are Ready before marking update end.
+	// New pods may still be starting up even though all old pods have been removed.
+	// Without this check, markRollingUpdateEnd fires prematurely, causing
+	// mutateCurrentHashes to see the update as complete while UpdatedReplicas
+	// still lags behind Replicas — creating a deadlock.
+	if int32(len(work.newTemplateHashReadyPods)) < *pclq.Spec.MinAvailable {
+		return groveerr.New(
+			groveerr.ErrCodeContinueReconcileAndRequeue,
+			component.OperationSync,
+			fmt.Sprintf("waiting for new pods to become ready before marking update end: %d ready, need %d",
+				len(work.newTemplateHashReadyPods), *pclq.Spec.MinAvailable),
+		)
+	}
 	return r.markRollingUpdateEnd(sc.ctx, logger, pclq)
 }
 
