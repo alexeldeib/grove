@@ -38,6 +38,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -641,17 +642,41 @@ func (sc *syncContext) getPodCliques(podGang *podGangInfo) []grovecorev1alpha1.P
 	return constituentPCLQs
 }
 
-// determinePCSGReplicas retrieves the number of replicas for a PCSG for a given PCS and PCS replica index.
-// If the PCSG exists then it will return the pcsg.Spec.Replicas value, else it will return the template replicas
-// as defined in grovecorev1alpha1.PodCliqueScalingGroupConfig.Replicas
+// determinePCSGReplicas retrieves the effective number of replicas for a PCSG.
+// If the PCSG exists then it will return the pcsg.Spec.Replicas value, plus
+// maxSurge if a rolling update is in progress. Otherwise it returns the template
+// replicas as defined in grovecorev1alpha1.PodCliqueScalingGroupConfig.Replicas.
 func (sc *syncContext) determinePCSGReplicas(pcsgFQN string, pcsgConfig grovecorev1alpha1.PodCliqueScalingGroupConfig) int {
 	foundExistingPCSG, ok := lo.Find(sc.existingPCSGs, func(pcsg grovecorev1alpha1.PodCliqueScalingGroup) bool {
 		return pcsg.Name == pcsgFQN
 	})
 	if ok {
-		return int(foundExistingPCSG.Spec.Replicas)
+		replicas := int(foundExistingPCSG.Spec.Replicas)
+		if componentutils.IsPCSGUpdateInProgress(&foundExistingPCSG) {
+			replicas += pcsgMaxSurge(&foundExistingPCSG)
+		}
+		return replicas
 	}
 	return int(*pcsgConfig.Replicas)
+}
+
+// pcsgMaxSurge returns the maxSurge value from the PCSG update strategy.
+// Defaults to 0 if not configured.
+func pcsgMaxSurge(pcsg *grovecorev1alpha1.PodCliqueScalingGroup) int {
+	if pcsg.Spec.UpdateStrategy == nil ||
+		pcsg.Spec.UpdateStrategy.RollingUpdate == nil ||
+		pcsg.Spec.UpdateStrategy.RollingUpdate.MaxSurge == nil {
+		return 0
+	}
+	val := *pcsg.Spec.UpdateStrategy.RollingUpdate.MaxSurge
+	if val.Type == intstr.Int {
+		return int(val.IntVal)
+	}
+	percentage, _ := intstr.GetScaledValueFromIntOrPercent(&val, int(pcsg.Spec.Replicas), true)
+	if percentage < 0 {
+		return 0
+	}
+	return max(1, percentage)
 }
 
 // syncFlowResult captures the result of a sync flow run.
