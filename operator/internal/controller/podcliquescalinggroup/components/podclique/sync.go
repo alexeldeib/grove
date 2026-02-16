@@ -142,7 +142,7 @@ func (r _resource) triggerDeletionOfExcessPCSGReplicas(logger logr.Logger, sc *s
 		pcsgObjectKey := client.ObjectKeyFromObject(sc.pcsg)
 		logger.Info("Found more PodCliques than expected, triggering deletion of excess PodCliques", "expected", int(sc.pcsg.Spec.Replicas), "existing", existingPCSGReplicas, "diff", diff)
 		reason := "Delete excess PodCliqueScalingGroup replicas"
-		replicaIndicesToDelete := computePCSGReplicasToDelete(existingPCSGReplicas, int(sc.pcsg.Spec.Replicas))
+		replicaIndicesToDelete := computePCSGReplicasToDelete(existingPCSGReplicas, effectiveReplicas)
 		deletionTasks := r.createDeleteTasks(logger, sc.pcs, pcsgObjectKey.Name, replicaIndicesToDelete, reason)
 		if err := r.triggerDeletionOfPodCliques(sc.ctx, logger, pcsgObjectKey, deletionTasks); err != nil {
 			return err
@@ -290,17 +290,22 @@ func (r _resource) getExistingPCLQs(ctx context.Context, pcsg *grovecorev1alpha1
 	return existingPCLQs, nil
 }
 
-// getExpectedPCLQPodTemplateHashMap computes the expected pod template hash for each PodClique in the PCSG
+// getExpectedPCLQPodTemplateHashMap computes the expected pod template hash for each PodClique in the PCSG.
+// During rolling updates with maxSurge > 0, includes surge replica indices so they can be recognized as updated.
 func getExpectedPCLQPodTemplateHashMap(pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grovecorev1alpha1.PodCliqueScalingGroup) map[string]string {
 	pclqFQNToHash := make(map[string]string)
 	pcsgPCLQNames := pcsg.Spec.CliqueNames
+	effectiveReplicas := int(pcsg.Spec.Replicas)
+	if componentutils.IsPCSGUpdateInProgress(pcsg) {
+		effectiveReplicas += resolveMaxSurge(pcsg)
+	}
 	for _, pcsgCliqueName := range pcsgPCLQNames {
 		pclqTemplateSpec := componentutils.FindPodCliqueTemplateSpecByName(pcs, pcsgCliqueName)
 		if pclqTemplateSpec == nil {
 			continue
 		}
 		podTemplateHash := componentutils.ComputePCLQPodTemplateHash(pclqTemplateSpec, pcs.Spec.Template.PriorityClassName)
-		for pcsgReplicaIndex := range int(pcsg.Spec.Replicas) {
+		for pcsgReplicaIndex := range effectiveReplicas {
 			cliqueFQN := apicommon.GeneratePodCliqueName(apicommon.ResourceNameReplica{
 				Name:    pcsg.Name,
 				Replica: pcsgReplicaIndex,
@@ -316,8 +321,13 @@ func getExpectedPCLQPodTemplateHashMap(pcs *grovecorev1alpha1.PodCliqueSet, pcsg
 // operates on a consistent state of existing PCLQs.
 // NOTE: We will be adding expectations usage in this components as well. Then all deletions will be captured as expectations and after every
 // deletion of PCSG we will re-queued.
-// refreshExistingPCLQs updates the sync context to remove PodCliques belonging to deleted PCSG replicas
+// refreshExistingPCLQs updates the sync context to remove PodCliques belonging to deleted PCSG replicas.
+// During rolling updates with maxSurge > 0, preserves surge replica PCLQs.
 func (sc *syncContext) refreshExistingPCLQs(pcsg *grovecorev1alpha1.PodCliqueScalingGroup) error {
+	effectiveReplicas := int(pcsg.Spec.Replicas)
+	if componentutils.IsPCSGUpdateInProgress(pcsg) {
+		effectiveReplicas += resolveMaxSurge(pcsg)
+	}
 	revisedExistingPCLQs := make([]grovecorev1alpha1.PodClique, 0, len(sc.existingPCLQs))
 	for _, pclq := range sc.existingPCLQs {
 		pcsgReplicaIndexStr, ok := pclq.Labels[apicommon.LabelPodCliqueScalingGroupReplicaIndex]
@@ -332,7 +342,7 @@ func (sc *syncContext) refreshExistingPCLQs(pcsg *grovecorev1alpha1.PodCliqueSca
 				fmt.Sprintf("invalid pcsg replica index label value found on PodClique: %v", client.ObjectKeyFromObject(&pclq)),
 			)
 		}
-		if pcsgReplicaIndex < int(pcsg.Spec.Replicas) {
+		if pcsgReplicaIndex < effectiveReplicas {
 			revisedExistingPCLQs = append(revisedExistingPCLQs, pclq)
 		}
 	}

@@ -72,9 +72,10 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 	maxUnavail := resolveMaxUnavailable(sc.pcsg)
 
 	// Compute how many replicas are currently "in-flight" (deleted/recreating but not yet updated).
-	// Total replicas minus old (pending+unavailable+ready) minus already updated = in-flight.
+	// Total effective replicas (including surge) minus old (pending+unavailable+ready) minus already updated = in-flight.
 	oldCount := len(work.oldPendingReplicaIndices) + len(work.oldUnavailableReplicaIndices) + len(work.oldReadyReplicaIndices)
-	inFlight := int(sc.pcsg.Spec.Replicas) - oldCount - work.updatedReplicaCount
+	effectiveReplicas := int(sc.pcsg.Spec.Replicas) + resolveMaxSurge(sc.pcsg)
+	inFlight := effectiveReplicas - oldCount - work.updatedReplicaCount
 
 	// If maxUnavailable replicas are already in-flight, wait for them to complete.
 	if inFlight > 0 && inFlight >= maxUnavail {
@@ -122,6 +123,17 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 			groveerr.ErrCodeContinueReconcileAndRequeue,
 			component.OperationSync,
 			fmt.Sprintf("started rolling update of %d PCSG replicas, requeuing", len(replicaIndicesToUpdate)),
+		)
+	}
+
+	// If old replicas still exist but can't be updated (e.g., maxUnavailable=0 with no surge capacity),
+	// requeue and wait for conditions to change.
+	if oldCount > 0 {
+		return groveerr.New(
+			groveerr.ErrCodeContinueReconcileAndRequeue,
+			component.OperationSync,
+			fmt.Sprintf("waiting for %d old replicas to be updated (%d ready, %d pending, %d unavailable), requeuing",
+				oldCount, len(work.oldReadyReplicaIndices), len(work.oldPendingReplicaIndices), len(work.oldUnavailableReplicaIndices)),
 		)
 	}
 
