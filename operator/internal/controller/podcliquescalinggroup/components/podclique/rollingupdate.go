@@ -77,19 +77,18 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 	effectiveReplicas := int(sc.pcsg.Spec.Replicas) + resolveMaxSurge(sc.pcsg)
 	inFlight := effectiveReplicas - oldCount - work.updatedReplicaCount
 
-	// If maxUnavailable replicas are already in-flight, wait for them to complete.
-	if inFlight > 0 && inFlight >= maxUnavail {
-		return groveerr.New(
-			groveerr.ErrCodeContinueReconcileAndRequeue,
-			component.OperationSync,
-			fmt.Sprintf("maxUnavailable reached: %d replicas in-flight (max %d), requeuing", inFlight, maxUnavail),
-		)
-	}
-
-	// Select up to (maxUnavailable - inFlight) more old ready replicas to update.
-	canUpdate := maxUnavail - inFlight
+	// Compute how many old replicas we can update, following Kubernetes Deployment
+	// semantics: available must not drop below (desired - maxUnavailable).
+	// Both maxUnavailable headroom and surge capacity contribute. For example,
+	// with spec.Replicas=1, maxSurge=1, maxUnavailable=0, available=2:
+	//   canUpdate = 2 - (1 - 0) - 0 = 1  (surge covers old replica replacement)
+	minAvailable := int(sc.pcsg.Spec.Replicas) - maxUnavail
+	canUpdate := int(sc.pcsg.Status.AvailableReplicas) - minAvailable - inFlight
 	if canUpdate > len(work.oldReadyReplicaIndices) {
 		canUpdate = len(work.oldReadyReplicaIndices)
+	}
+	if canUpdate < 0 {
+		canUpdate = 0
 	}
 
 	if canUpdate > 0 {
