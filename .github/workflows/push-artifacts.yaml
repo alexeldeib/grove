@@ -20,6 +20,8 @@ on:
   push:
     branches:
       - "main"
+      # Fork-only development images used for integration testing before an upstream release.
+      - "ace/**"
   workflow_call:
     inputs:
       version:
@@ -33,11 +35,12 @@ permissions:
 
 jobs:
   build-and-push:
+    if: github.repository == 'alexeldeib/grove' || github.ref == 'refs/heads/main'
     name: Build & Push
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set package version
         run: |

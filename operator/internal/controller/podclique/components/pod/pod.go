@@ -144,12 +144,16 @@ func (r _resource) buildResource(pcs *grovecorev1alpha1.PodCliqueSet, pclq *grov
 		)
 	}
 
-	labels := getLabels(pclq.ObjectMeta, pcsName, podGangName, pcsReplicaIndex)
+	labels, annotations := withKueuePodGroupMetadata(
+		getLabels(pclq.ObjectMeta, pcsName, podGangName, pcsReplicaIndex),
+		pclq.Annotations,
+		podGangName,
+	)
 	pod.ObjectMeta = metav1.ObjectMeta{
 		GenerateName: fmt.Sprintf("%s-", pclq.Name),
 		Namespace:    pclq.Namespace,
 		Labels:       labels,
-		Annotations:  pclq.Annotations,
+		Annotations:  annotations,
 	}
 	if err = controllerutil.SetControllerReference(pclq, pod, r.scheme); err != nil {
 		return groveerr.WrapError(err,
