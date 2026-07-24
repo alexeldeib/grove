@@ -25,18 +25,28 @@ import (
 
 func TestRequiredTopologyKeyForPodGroup(t *testing.T) {
 	podGroupKey := "kubernetes.io/hostname"
+	groupKey := "topology.ai-dynamo.io/rack"
 	podGangKey := "topology.kubernetes.io/zone"
 	podGang := &groveschedulerv1alpha1.PodGang{
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			TopologyConstraint: requiredTopologyConstraint(podGangKey),
 			PodGroups: []groveschedulerv1alpha1.PodGroup{
 				{Name: "worker", TopologyConstraint: requiredTopologyConstraint(podGroupKey)},
+				{Name: "leader"},
 				{Name: "frontend"},
+			},
+			TopologyConstraintGroupConfigs: []groveschedulerv1alpha1.TopologyConstraintGroupConfig{
+				{
+					Name:               "worker-group",
+					PodGroupNames:      []string{"worker", "leader"},
+					TopologyConstraint: requiredTopologyConstraint(groupKey),
+				},
 			},
 		},
 	}
 
 	assert.Equal(t, podGroupKey, RequiredTopologyKeyForPodGroup(podGang, "worker", "fallback"))
+	assert.Equal(t, groupKey, RequiredTopologyKeyForPodGroup(podGang, "leader", "fallback"))
 	assert.Equal(t, podGangKey, RequiredTopologyKeyForPodGroup(podGang, "frontend", "fallback"))
 	assert.Equal(t, podGangKey, RequiredTopologyKeyForPodGroup(podGang, "missing", "fallback"))
 	assert.Equal(t, "fallback", RequiredTopologyKeyForPodGroup(nil, "worker", "fallback"))

@@ -47,6 +47,7 @@ const (
 	podGroupServingAnnotation        = "kueue.x-k8s.io/pod-group-serving"
 	retriableInGroupAnnotation       = "kueue.x-k8s.io/retriable-in-group"
 	podSetRequiredTopologyAnnotation = "kueue.x-k8s.io/podset-required-topology"
+	isGroupWorkloadAnnotation        = "kueue.x-k8s.io/is-group-workload"
 	roleHashAnnotation               = "kueue.x-k8s.io/role-hash"
 )
 
@@ -181,12 +182,17 @@ func (b *schedulerBackend) buildPrebuiltWorkload(pcs *grovecorev1alpha1.PodCliqu
 			minCountUsed = true
 		}
 		if topologyKey != "" {
-			podSet["topologyRequest"] = map[string]any{"required": topologyKey}
+			topologyRequest := map[string]any{"required": topologyKey}
+			if groupName := topologyGroupNameForPodGroup(podGang, podGroup.Name); groupName != "" {
+				topologyRequest["podSetGroupName"] = groupName
+			}
+			podSet["topologyRequest"] = topologyRequest
 		}
 		podSets = append(podSets, podSet)
 	}
 
 	workload := newKueueWorkload(podGang.Namespace, podGang.Name)
+	workload.SetAnnotations(map[string]string{isGroupWorkloadAnnotation: "true"})
 	if err := unstructured.SetNestedField(workload.Object, queueName, "spec", "queueName"); err != nil {
 		return nil, err
 	}
@@ -199,6 +205,19 @@ func (b *schedulerBackend) buildPrebuiltWorkload(pcs *grovecorev1alpha1.PodCliqu
 		return nil, fmt.Errorf("failed to set owner reference on prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
 	}
 	return workload, nil
+}
+
+// topologyGroupNameForPodGroup returns the Grove topology constraint group that contains the PodGroup.
+// Kueue uses podSetGroupName to place all PodSets in that group within the same topology domain.
+func topologyGroupNameForPodGroup(podGang *groveschedulerv1alpha1.PodGang, podGroupName string) string {
+	for _, group := range podGang.Spec.TopologyConstraintGroupConfigs {
+		for _, name := range group.PodGroupNames {
+			if name == podGroupName {
+				return group.Name
+			}
+		}
+	}
+	return ""
 }
 
 // isCliqueInScalingGroup reports whether the named clique is a member of any PodCliqueScalingGroup.

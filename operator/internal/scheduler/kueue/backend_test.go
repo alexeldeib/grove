@@ -293,6 +293,7 @@ func TestBackend_SyncPodGang_CreatesPrebuiltWorkloadForSimplePCS(t *testing.T) {
 
 	queueName, _, _ := unstructured.NestedString(got.Object, "spec", "queueName")
 	assert.Equal(t, "grove-poc", queueName)
+	assert.Equal(t, "true", got.GetAnnotations()[isGroupWorkloadAnnotation])
 
 	ownerRefs := got.GetOwnerReferences()
 	require.Len(t, ownerRefs, 1)
@@ -311,6 +312,7 @@ func TestBackend_SyncPodGang_CreatesPrebuiltWorkloadForSimplePCS(t *testing.T) {
 
 func TestBackend_SyncPodGang_CreatesPrebuiltWorkloadForPCSGWithMinCountEqualsCount(t *testing.T) {
 	pcsgReplicas := int32(2)
+	rackKey := "topology.ai-dynamo.io/rack"
 	pcs := &grovecorev1alpha1.PodCliqueSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "demo",
@@ -343,9 +345,19 @@ func TestBackend_SyncPodGang_CreatesPrebuiltWorkloadForPCSGWithMinCountEqualsCou
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{
+				{Name: "demo-0-decode-0-leader", MinReplicas: 1},
 				// MinReplicas is deliberately lower than the clique replicas to prove the PCSG
 				// all-or-nothing override forces minCount == count.
 				{Name: "demo-0-decode-0-worker", MinReplicas: 1},
+			},
+			TopologyConstraintGroupConfigs: []groveschedulerv1alpha1.TopologyConstraintGroupConfig{
+				{
+					Name:          "demo-0-decode-0",
+					PodGroupNames: []string{"demo-0-decode-0-leader", "demo-0-decode-0-worker"},
+					TopologyConstraint: &groveschedulerv1alpha1.TopologyConstraint{
+						PackConstraint: &groveschedulerv1alpha1.TopologyPackConstraint{Required: &rackKey},
+					},
+				},
 			},
 		},
 	}
@@ -357,14 +369,21 @@ func TestBackend_SyncPodGang_CreatesPrebuiltWorkloadForPCSGWithMinCountEqualsCou
 	require.NoError(t, cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "demo-0"}, got))
 
 	podSets, _, _ := unstructured.NestedSlice(got.Object, "spec", "podSets")
-	require.Len(t, podSets, 1)
-	podSet := podSets[0].(map[string]any)
-	assert.Equal(t, "demo-0-decode-0-worker", podSet["name"])
-	assert.Equal(t, int64(2), podSet["count"])
-	// PodCliqueScalingGroup cliques are all-or-nothing: minCount is omitted (Kueue defaults it to count).
-	// Kueue also rejects Workloads where more than one podSet sets minCount.
-	_, hasMinCount := podSet["minCount"]
-	assert.False(t, hasMinCount)
+	require.Len(t, podSets, 2)
+	for _, item := range podSets {
+		podSet := item.(map[string]any)
+		// PodCliqueScalingGroup cliques are all-or-nothing: minCount is omitted (Kueue defaults it to count).
+		// Kueue also rejects Workloads where more than one podSet sets minCount.
+		_, hasMinCount := podSet["minCount"]
+		assert.False(t, hasMinCount)
+		topologyRequest := podSet["topologyRequest"].(map[string]any)
+		assert.Equal(t, rackKey, topologyRequest["required"])
+		assert.Equal(t, "demo-0-decode-0", topologyRequest["podSetGroupName"])
+	}
+	assert.Equal(t, "demo-0-decode-0-leader", podSets[0].(map[string]any)["name"])
+	assert.Equal(t, int64(1), podSets[0].(map[string]any)["count"])
+	assert.Equal(t, "demo-0-decode-0-worker", podSets[1].(map[string]any)["name"])
+	assert.Equal(t, int64(2), podSets[1].(map[string]any)["count"])
 }
 
 func TestBackend_ValidatePodCliqueSet_MinCount(t *testing.T) {
