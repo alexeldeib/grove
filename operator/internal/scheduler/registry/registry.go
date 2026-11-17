@@ -98,7 +98,7 @@ func (r *registry) AllTopologyAware() map[string]scheduler.TopologyAwareBackend 
 func newSchedulerBackend(cl, directClient client.Client, scheme *runtime.Scheme, rec record.EventRecorder, p configv1alpha1.SchedulerProfile) (scheduler.Backend, error) {
 	var b scheduler.Backend
 	switch p.Name {
-	case configv1alpha1.SchedulerNameKube:
+	case configv1alpha1.SchedulerNameKube, configv1alpha1.SchedulerNameBinpack:
 		b = kube.New(cl, scheme, rec, p)
 	case configv1alpha1.SchedulerNameKai:
 		b = kai.New(cl, scheme, rec, p)
