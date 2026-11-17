@@ -348,6 +348,29 @@ func (tc *TopologyConstraint) ReferencedDomains() []TopologyDomain {
 	return domains
 }
 
+// RollingUpdateConfiguration carries per-component knobs that bound disruption
+// during a rolling update.
+//
+// Field shape and placement intentionally match the upstream GREP-393 proposal
+// (docs/proposals/393-coherent-rolling-updates) so this patch can be dropped once
+// Coherent updates ship upstream, without migrating any configured values.
+type RollingUpdateConfiguration struct {
+	// MaxUnavailable bounds the disruption Grove causes while updating this
+	// PodCliqueScalingGroup. Grove stops taking down ready replicas once this many replicas are
+	// unavailable, and recreates at most this many already-unavailable replicas per reconcile.
+	// A replica counts as unavailable while any of its PodCliques is missing, terminating or not
+	// ready, including one already recreated at the new PodTemplateHash whose Pods have not
+	// become available yet.
+	// Recovery is never blocked: replacing an already-unavailable replica does not change how
+	// many replicas are unavailable, so it stays permitted even at the cap. What the cap
+	// prevents is an update taking down healthy replicas faster than replacements become
+	// available.
+	// When unset, Grove keeps its existing unbounded behaviour.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxUnavailable *int32 `json:"maxUnavailable,omitempty"`
+}
+
 // PodCliqueScalingGroupConfig is a group of PodClique's that are scaled together.
 // Each member PodClique.Replicas will be computed as a product of PodCliqueScalingGroupConfig.Replicas and PodCliqueTemplateSpec.Spec.Replicas.
 // NOTE: If a PodCliqueScalingGroupConfig is defined, then for the member PodClique's, individual AutoScalingConfig cannot be defined.
@@ -382,6 +405,9 @@ type PodCliqueScalingGroupConfig struct {
 	// +optional
 	// +kubebuilder:default=1
 	MinAvailable *int32 `json:"minAvailable,omitempty"`
+	// RollingUpdate is the per-component update configuration for this PodCliqueScalingGroup.
+	// +optional
+	RollingUpdate *RollingUpdateConfiguration `json:"rollingUpdate,omitempty"`
 	// ScaleConfig is the horizontal pod autoscaler configuration for the pod clique scaling group.
 	// +optional
 	ScaleConfig *AutoScalingConfig `json:"scaleConfig,omitempty"`

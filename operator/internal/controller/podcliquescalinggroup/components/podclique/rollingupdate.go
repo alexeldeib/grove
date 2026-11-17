@@ -58,8 +58,12 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 			component.OperationSync,
 			fmt.Sprintf("failed to compute pending update work for PodCliqueScalingGroup %v", client.ObjectKeyFromObject(sc.pcsg)))
 	}
-	// always delete PCSG replicas that are either pending or unavailable
-	if err = r.deleteOldPendingAndUnavailableReplicas(logger, sc, work); err != nil {
+	// The disruption budget is computed once from live replica state so that both deletion
+	// paths below draw from the same allowance.
+	budget := computeUnavailableBudget(sc)
+
+	// delete PCSG replicas that are either pending or unavailable, within the budget
+	if err = r.deleteOldPendingAndUnavailableReplicas(logger, sc, work, budget); err != nil {
 		return err
 	}
 
@@ -76,6 +80,17 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 	// Either of the cases requires selecting the next replica index to update.
 	var nextReplicaIndexToUpdate *int
 	if len(work.oldReadyReplicaIndices) > 0 {
+		// Taking down a ready replica adds one to the unavailable count, so it requires headroom
+		// in the budget. Without this gate a replica recreated at the new hash but still pending
+		// would free the machinery to take down the next ready replica, and repeated reconciles
+		// would drain the scaling group despite the configured maxUnavailable.
+		if budget != nil && budget.remaining == 0 {
+			return groveerr.New(
+				groveerr.ErrCodeContinueReconcileAndRequeue,
+				component.OperationSync,
+				fmt.Sprintf("maxUnavailable budget for PodCliqueScalingGroup %v is exhausted, requeuing", client.ObjectKeyFromObject(sc.pcsg)),
+			)
+		}
 		if sc.pcsg.Status.AvailableReplicas < *sc.pcsg.Spec.MinAvailable {
 			return groveerr.New(
 				groveerr.ErrCodeContinueReconcileAndRequeue,
@@ -192,13 +207,93 @@ func computePendingUpdateWork(sc *syncContext) (*updateWork, error) {
 }
 
 // deleteOldPendingAndUnavailableReplicas removes PCSG replicas that are pending or unavailable with old configurations
-func (r _resource) deleteOldPendingAndUnavailableReplicas(logger logr.Logger, sc *syncContext, work *updateWork) error {
-	replicaIndicesToDelete := lo.Map(append(work.oldPendingReplicaIndices, work.oldUnavailableReplicaIndices...), func(index int, _ int) string {
+func (r _resource) deleteOldPendingAndUnavailableReplicas(logger logr.Logger, sc *syncContext, work *updateWork, budget *unavailableBudget) error {
+	candidateIndices := limitConcurrentReclaims(logger, budget, append(work.oldPendingReplicaIndices, work.oldUnavailableReplicaIndices...))
+	replicaIndicesToDelete := lo.Map(candidateIndices, func(index int, _ int) string {
 		return strconv.Itoa(index)
 	})
 	deleteTasks := r.createDeleteTasks(logger, sc.pcs, sc.pcsg.Name, replicaIndicesToDelete,
 		"delete pending and unavailable PodCliqueScalingGroup replicas for rolling update")
 	return r.triggerDeletionOfPodCliques(sc.ctx, logger, client.ObjectKeyFromObject(sc.pcsg), deleteTasks)
+}
+
+// unavailableBudget bounds the two kinds of work a rolling update performs. A nil budget means
+// the component did not configure maxUnavailable and the previous unbounded behaviour applies.
+//
+// The two bounds are deliberately independent. Taking down a ready replica increases how many
+// replicas are unavailable, so it draws from remaining. Recreating a replica that is already
+// unavailable does not change that count, so it is capped only for concurrency and stays
+// permitted when remaining is zero - otherwise a group that is already at its cap could never
+// recover.
+type unavailableBudget struct {
+	// maxConcurrentReclaims caps how many already-unavailable replicas are recreated per reconcile.
+	maxConcurrentReclaims int
+	// remaining is the headroom for taking down additional ready replicas.
+	remaining int
+}
+
+// computeUnavailableBudget derives the remaining disruption budget from the replicas that are
+// unavailable at this moment, rather than from the candidates of a single reconcile.
+//
+// Counting live state is what makes the budget hold across reconciles: a replica that has been
+// deleted and recreated at the new PodTemplateHash still counts against the budget until its
+// Pods are actually available, so hash convergence alone cannot release a slot and let the next
+// reconcile take down another replica.
+func computeUnavailableBudget(sc *syncContext) *unavailableBudget {
+	if sc.pcsgConfig == nil || sc.pcsgConfig.RollingUpdate == nil || sc.pcsgConfig.RollingUpdate.MaxUnavailable == nil {
+		return nil
+	}
+	// A non-positive value cannot be created through the API (the CRD enforces Minimum=1), but
+	// an object written before the schema existed or through a path that skipped validation must
+	// not silently fall back to unbounded disruption. Fail closed onto the strictest valid
+	// setting rather than clamping to zero, which would block recovery entirely.
+	maxUnavailable := max(1, int(*sc.pcsgConfig.RollingUpdate.MaxUnavailable))
+	return &unavailableBudget{
+		maxConcurrentReclaims: maxUnavailable,
+		remaining:             max(0, maxUnavailable-countUnavailableReplicas(sc)),
+	}
+}
+
+// countUnavailableReplicas counts PCSG replicas that are not available at this moment. A replica
+// is unavailable when any of its expected PodCliques is missing, when any of them is terminating,
+// or when the replica is not in the ready state.
+func countUnavailableReplicas(sc *syncContext) int {
+	existingPCLQsByReplicaIndex := componentutils.GroupPCLQsByPCSGReplicaIndex(sc.existingPCLQs)
+	unavailable := 0
+	for pcsgReplicaIndex := range int(sc.pcsg.Spec.Replicas) {
+		existingPCSGReplicaPCLQs := existingPCLQsByReplicaIndex[strconv.Itoa(pcsgReplicaIndex)]
+		if len(existingPCSGReplicaPCLQs) != len(sc.expectedPCLQFQNsPerPCSGReplica[pcsgReplicaIndex]) {
+			unavailable++
+			continue
+		}
+		if lo.SomeBy(existingPCSGReplicaPCLQs, func(pclq grovecorev1alpha1.PodClique) bool {
+			return k8sutils.IsResourceTerminating(pclq.ObjectMeta)
+		}) {
+			unavailable++
+			continue
+		}
+		if getReplicaState(existingPCSGReplicaPCLQs) != replicaStateReady {
+			unavailable++
+		}
+	}
+	return unavailable
+}
+
+// limitConcurrentReclaims truncates the already-unavailable replica indices recreated in this
+// reconcile. Reclaiming every one at once recreates all of their Pods simultaneously, so a
+// cluster that cannot schedule the new Pods gets a stampede rather than a bounded retry. The
+// remainder is reclaimed on later reconciles.
+//
+// This is capped by maxConcurrentReclaims rather than remaining: these replicas are unavailable
+// already, so replacing them does not increase the unavailable count, and gating them on
+// remaining would leave a group that is at its cap unable to recover.
+func limitConcurrentReclaims(logger logr.Logger, budget *unavailableBudget, replicaIndices []int) []int {
+	if budget == nil || len(replicaIndices) <= budget.maxConcurrentReclaims {
+		return replicaIndices
+	}
+	logger.Info("Limiting PodCliqueScalingGroup replicas reclaimed this reconcile to maxUnavailable",
+		"maxConcurrentReclaims", budget.maxConcurrentReclaims, "candidateCount", len(replicaIndices))
+	return replicaIndices[:budget.maxConcurrentReclaims]
 }
 
 // isAnyReadyReplicaSelectedForUpdate checks if there is currently a ready replica selected for rolling update
