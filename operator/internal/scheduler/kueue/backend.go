@@ -128,6 +128,11 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 		}
 		return fmt.Errorf("failed to get prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
 	}
+	// An evicted Workload lingers until Kueue clears its finalizer; recreating now would race the
+	// pending deletion, so wait for it to disappear and let a later reconcile recreate it.
+	if existing.GetDeletionTimestamp() != nil {
+		return nil
+	}
 	return b.updatePrebuiltWorkloadIfNeeded(ctx, podGang, existing, desired)
 }
 
@@ -141,7 +146,9 @@ func newKueueWorkload(namespace, name string) *unstructured.Unstructured {
 
 // updatePrebuiltWorkloadIfNeeded reconciles the Grove-owned Workload fields while preserving metadata and
 // status managed by Kueue. Kueue permits podSet updates before quota reservation, but makes them immutable
-// afterwards, so reject admitted drift explicitly instead of silently leaving a stale Workload behind.
+// afterwards and finalizes the Workload (Finished/OutOfSync) when the owning PodGang changes shape. Neither
+// case can be updated in place, so evict the stale Workload and let the next reconcile recreate it to drive
+// a fresh admission with the current podSets.
 func (b *schedulerBackend) updatePrebuiltWorkloadIfNeeded(
 	ctx context.Context,
 	podGang *groveschedulerv1alpha1.PodGang,
@@ -156,8 +163,12 @@ func (b *schedulerBackend) updatePrebuiltWorkloadIfNeeded(
 		return fmt.Errorf("failed to read desired prebuilt kueue Workload %s/%s spec: %w", desired.GetNamespace(), desired.GetName(), err)
 	}
 	specChanged := !equality.Semantic.DeepEqual(existingSpec, desiredSpec)
-	if specChanged && workloadHasQuotaReservation(existing) {
-		return fmt.Errorf("prebuilt kueue Workload %s/%s differs from PodGang %s after quota reservation and cannot be updated", existing.GetNamespace(), existing.GetName(), podGang.Name)
+	if workloadFinished(existing) || (specChanged && workloadHasQuotaReservation(existing)) {
+		if err := b.client.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to evict stale prebuilt kueue Workload %s/%s for PodGang %s: %w", existing.GetNamespace(), existing.GetName(), podGang.Name, err)
+		}
+		log.FromContext(ctx).Info("Evicted stale prebuilt Kueue Workload for recreation", "workload", client.ObjectKeyFromObject(existing))
+		return nil
 	}
 
 	originalAnnotations := existing.GetAnnotations()
@@ -202,6 +213,20 @@ func workloadHasQuotaReservation(workload *unstructured.Unstructured) bool {
 	}
 	admission, found, _ := unstructured.NestedMap(workload.Object, "status", "admission")
 	return found && len(admission) > 0
+}
+
+// workloadFinished reports whether Kueue has finalized the Workload. Kueue sets this terminal condition
+// when a prebuilt Workload falls out of sync with its pod group (e.g. a scaling-group replica is added),
+// after which it can never re-admit and must be recreated.
+func workloadFinished(workload *unstructured.Unstructured) bool {
+	conditions, _, _ := unstructured.NestedSlice(workload.Object, "status", "conditions")
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]any)
+		if ok && condition["type"] == "Finished" && condition["status"] == "True" {
+			return true
+		}
+	}
+	return false
 }
 
 // buildPrebuiltWorkload constructs a prebuilt Kueue Workload from a PodGang, mapping each PodGroup to a Kueue
