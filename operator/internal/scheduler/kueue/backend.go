@@ -57,6 +57,11 @@ const (
 	kueueWorkloadStateCreated        = "created"
 	kueueWorkloadStateRecreate       = "recreate-pending"
 	kueueWorkloadStateDeactivated    = "deactivated"
+	// admissionGatedByAnnotation is Kueue's admission gate (KEP-6915, feature AdmissionGatedBy,
+	// beta and on by default from Kueue 0.19). While it lists any gate, Kueue will not reserve quota
+	// for the Workload. Kueue's webhook accepts gates only when the Workload is created; after that
+	// they can only be removed.
+	admissionGatedByAnnotation = "kueue.x-k8s.io/admission-gated-by"
 )
 
 const (
@@ -86,6 +91,10 @@ type schedulerBackend struct {
 	eventRecorder record.EventRecorder
 	profile       configv1alpha1.SchedulerProfile
 	config        configv1alpha1.KueueSchedulerConfiguration
+	// admissionGatesForCreate returns the Kueue admission gates a newly created Workload for the
+	// PodGang must carry. Nil means none. It is consulted only on the create path, because Kueue
+	// rejects adding a gate to an existing Workload.
+	admissionGatesForCreate func(context.Context, *groveschedulerv1alpha1.PodGang) ([]string, error)
 }
 
 var _ scheduler.Backend = (*schedulerBackend)(nil)
@@ -147,6 +156,15 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 	existing := newKueueWorkload(podGang.Namespace, podGang.Name)
 	if err = b.client.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
 		if apierrors.IsNotFound(err) {
+			// The latch check at the top of SyncPodGang reads the cached PodGang, so a reconcile that
+			// predates the latch can arrive here. Recreating would reuse an identity whose quota and
+			// topology assignment Kueue has already released, so confirm the state live first.
+			if workloadState, err = b.podGangWorkloadStateUncached(ctx, podGang); err != nil {
+				return err
+			}
+			if workloadState == kueueWorkloadStateDeactivated {
+				return fmt.Errorf("refusing to recreate Kueue Workload for PodGang %s/%s after Kueue deactivated its prior lease", podGang.Namespace, podGang.Name)
+			}
 			if workloadState == kueueWorkloadStateCreated {
 				return fmt.Errorf("refusing to recreate unexpectedly missing prebuilt kueue Workload %s/%s under the same PodGang identity", podGang.Namespace, podGang.Name)
 			}
@@ -159,13 +177,21 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 					return fmt.Errorf("refusing to create missing prebuilt kueue Workload %s/%s for an unmarked legacy PodGang while Pods still consume a prior admission", podGang.Namespace, podGang.Name)
 				}
 			}
+			var gates []string
+			if b.admissionGatesForCreate != nil {
+				if gates, err = b.admissionGatesForCreate(ctx, podGang); err != nil {
+					return err
+				}
+			}
+			setAdmissionGates(desired, gates)
 			if err = b.client.Create(ctx, desired); err != nil {
 				return fmt.Errorf("failed to create prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
 			}
 			if err = b.setPodGangWorkloadState(ctx, podGang, kueueWorkloadStateCreated); err != nil {
 				return err
 			}
-			log.FromContext(ctx).Info("Created prebuilt Kueue Workload", "workload", client.ObjectKeyFromObject(desired))
+			log.FromContext(ctx).Info("Created prebuilt Kueue Workload",
+				"workload", client.ObjectKeyFromObject(desired), "admissionGates", gates)
 			return nil
 		}
 		return fmt.Errorf("failed to get prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
@@ -220,6 +246,87 @@ func (b *schedulerBackend) setPodGangWorkloadState(
 		return fmt.Errorf("failed to set Kueue Workload state %q on PodGang %s/%s: %w", state, podGang.Namespace, podGang.Name, err)
 	}
 	return nil
+}
+
+// podGangWorkloadStateUncached re-reads the PodGang's Workload state annotation past the informer
+// cache and refreshes the caller's copy with it, so the decisions that follow agree with the API
+// server. A PodGang that no longer exists reports the cached value.
+func (b *schedulerBackend) podGangWorkloadStateUncached(ctx context.Context, podGang *groveschedulerv1alpha1.PodGang) (string, error) {
+	reader := b.directClient
+	if reader == nil {
+		reader = b.client
+	}
+	live := &groveschedulerv1alpha1.PodGang{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(podGang), live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return podGang.Annotations[kueueWorkloadStateAnnotation], nil
+		}
+		return "", fmt.Errorf("failed to re-read PodGang %s/%s: %w", podGang.Namespace, podGang.Name, err)
+	}
+	state := live.Annotations[kueueWorkloadStateAnnotation]
+	if podGang.Annotations == nil {
+		podGang.Annotations = map[string]string{}
+	}
+	if state == "" {
+		delete(podGang.Annotations, kueueWorkloadStateAnnotation)
+	} else {
+		podGang.Annotations[kueueWorkloadStateAnnotation] = state
+	}
+	return state, nil
+}
+
+// workloadAdmissionGates returns the gates listed in a Workload's admission-gated-by annotation.
+func workloadAdmissionGates(workload *unstructured.Unstructured) []string {
+	var gates []string
+	for _, gate := range strings.Split(workload.GetAnnotations()[admissionGatedByAnnotation], ",") {
+		if gate = strings.TrimSpace(gate); gate != "" {
+			gates = append(gates, gate)
+		}
+	}
+	return gates
+}
+
+// setAdmissionGates writes gates onto a Workload that is about to be created. It is only valid
+// before creation; on an existing Workload use releaseAdmissionGate.
+func setAdmissionGates(workload *unstructured.Unstructured, gates []string) {
+	if len(gates) == 0 {
+		return
+	}
+	annotations := workload.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[admissionGatedByAnnotation] = strings.Join(gates, ",")
+	workload.SetAnnotations(annotations)
+}
+
+// releaseAdmissionGate removes one gate from an existing Workload and deletes the annotation once no
+// gates remain, which is the only change Kueue accepts after creation. Gates owned by other
+// controllers are kept. It writes with Update, like the rest of this backend: the operator's role
+// grants update but not patch on Workloads, and the resourceVersion check turns a concurrent write
+// into a retried conflict. It reports whether the Workload was changed.
+func (b *schedulerBackend) releaseAdmissionGate(ctx context.Context, workload *unstructured.Unstructured, gate string) (bool, error) {
+	gates := workloadAdmissionGates(workload)
+	remaining := make([]string, 0, len(gates))
+	for _, g := range gates {
+		if g != gate {
+			remaining = append(remaining, g)
+		}
+	}
+	if len(remaining) == len(gates) {
+		return false, nil
+	}
+	annotations := workload.GetAnnotations()
+	if len(remaining) == 0 {
+		delete(annotations, admissionGatedByAnnotation)
+	} else {
+		annotations[admissionGatedByAnnotation] = strings.Join(remaining, ",")
+	}
+	workload.SetAnnotations(annotations)
+	if err := b.client.Update(ctx, workload); err != nil {
+		return false, fmt.Errorf("failed to release admission gate %q on prebuilt kueue Workload %s/%s: %w", gate, workload.GetNamespace(), workload.GetName(), err)
+	}
+	return true, nil
 }
 
 func newKueueWorkload(namespace, name string) *unstructured.Unstructured {
