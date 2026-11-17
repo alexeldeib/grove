@@ -20,10 +20,12 @@ import (
 	"testing"
 	"time"
 
+	apicommonconstants "github.com/ai-dynamo/grove/operator/api/common/constants"
 	testutils "github.com/ai-dynamo/grove/operator/test/utils"
 
 	"github.com/stretchr/testify/assert"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -38,13 +40,43 @@ func TestGetStatusResyncInterval(t *testing.T) {
 	tests := []struct {
 		name             string
 		terminationDelay *time.Duration
+		breachStatus     metav1.ConditionStatus
+		breachAge        time.Duration
 		getPCSFails      bool
 		expected         time.Duration
 	}{
 		{
-			name:             "TerminationDelay shorter than the resync interval bounds the interval",
+			name:             "short delay leaves scheduling headroom even without a recorded breach",
 			terminationDelay: ptr.To(2 * time.Minute),
-			expected:         2 * time.Minute,
+			expected:         time.Minute,
+		},
+		{
+			name:             "aged breach retries before its remaining deadline",
+			terminationDelay: ptr.To(time.Minute),
+			breachStatus:     metav1.ConditionTrue,
+			breachAge:        55 * time.Second,
+			expected:         2500 * time.Millisecond,
+		},
+		{
+			name:             "long policy with an aged breach uses its remaining window",
+			terminationDelay: ptr.To(4 * time.Hour),
+			breachStatus:     metav1.ConditionTrue,
+			breachAge:        4*time.Hour - 20*time.Second,
+			expected:         10 * time.Second,
+		},
+		{
+			name:             "elapsed breach retries promptly without hot-looping",
+			terminationDelay: ptr.To(time.Minute),
+			breachStatus:     metav1.ConditionTrue,
+			breachAge:        61 * time.Second,
+			expected:         time.Second,
+		},
+		{
+			name:             "cleared breach does not retain its old deadline",
+			terminationDelay: ptr.To(time.Minute),
+			breachStatus:     metav1.ConditionFalse,
+			breachAge:        time.Hour,
+			expected:         30 * time.Second,
 		},
 		{
 			name:             "TerminationDelay longer than the resync interval keeps the resync interval",
@@ -64,12 +96,19 @@ func TestGetStatusResyncInterval(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			now := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
 			pcsBuilder := testutils.NewPodCliqueSetBuilder(pcsName, namespace, "uid")
 			if tt.terminationDelay != nil {
 				pcsBuilder.WithTerminationDelay(*tt.terminationDelay)
 			}
 			pcs := pcsBuilder.Build()
 			pclq := testutils.NewPodCliqueBuilder(pcsName, "uid", "clq", namespace, 0).Build()
+			if tt.breachStatus != "" {
+				pclq.Status.Conditions = []metav1.Condition{{
+					Type: apicommonconstants.ConditionTypeMinAvailableBreached, Status: tt.breachStatus,
+					LastTransitionTime: metav1.NewTime(now.Add(-tt.breachAge)),
+				}}
+			}
 
 			clientBuilder := testutils.NewTestClientBuilder().WithObjects(pcs, pclq)
 			if tt.getPCSFails {
@@ -79,7 +118,7 @@ func TestGetStatusResyncInterval(t *testing.T) {
 			}
 			r := &Reconciler{client: clientBuilder.Build()}
 
-			actual := r.getStatusResyncInterval(context.Background(), pclq)
+			actual := r.getStatusResyncInterval(context.Background(), pclq, now)
 			assert.Equal(t, tt.expected, actual)
 		})
 	}

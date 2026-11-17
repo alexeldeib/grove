@@ -16,10 +16,12 @@ package podcliquescalinggroup
 
 import (
 	"context"
+	"time"
 
 	"github.com/ai-dynamo/grove/operator/api/common/constants"
 	groveconfigv1alpha1 "github.com/ai-dynamo/grove/operator/api/config/v1alpha1"
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
+	internalconstants "github.com/ai-dynamo/grove/operator/internal/constants"
 	ctrlcommon "github.com/ai-dynamo/grove/operator/internal/controller/common"
 	"github.com/ai-dynamo/grove/operator/internal/controller/common/component"
 	componentutils "github.com/ai-dynamo/grove/operator/internal/controller/common/component/utils"
@@ -80,13 +82,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		deletionOrSpecReconcileFlowResult = r.reconcileSpec(ctx, specLog, pcsg)
 	}
 
-	if statusReconcileResult := r.reconcileStatus(ctx, logger, ctrlclient.ObjectKeyFromObject(pcsg)); ctrlcommon.ShortCircuitReconcileFlow(statusReconcileResult) {
-		return statusReconcileResult.Result()
+	statusReconcileResult := r.reconcileStatus(ctx, logger, ctrlclient.ObjectKeyFromObject(pcsg))
+	result, err := ctrlcommon.MergeStepResults(deletionOrSpecReconcileFlowResult, statusReconcileResult).Result()
+	// Unchanged child status does not produce a watch event. Periodically repair the group's own
+	// stale availability condition as well, preserving shorter spec/conflict retries and errors.
+	if err == nil && pcsg.DeletionTimestamp.IsZero() {
+		interval := r.getStatusResyncInterval(ctx, pcsg, time.Now())
+		if result.RequeueAfter == 0 || interval < result.RequeueAfter {
+			result.RequeueAfter = interval
+		}
 	}
+	return result, err
+}
 
-	if ctrlcommon.ShortCircuitReconcileFlow(deletionOrSpecReconcileFlowResult) {
-		return deletionOrSpecReconcileFlowResult.Result()
+func (r *Reconciler) getStatusResyncInterval(ctx context.Context, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, now time.Time) time.Duration {
+	pcs, err := componentutils.GetPodCliqueSet(ctx, r.client, pcsg.ObjectMeta)
+	if err != nil || pcs.Spec.Template.TerminationDelay == nil {
+		return internalconstants.PodCliqueStatusResyncInterval
 	}
-
-	return ctrlcommon.DoNotRequeue().Result()
+	return componentutils.StatusResyncInterval(pcs.Spec.Template.TerminationDelay.Duration, pcsg.Status.Conditions, now)
 }
