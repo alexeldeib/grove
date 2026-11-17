@@ -47,10 +47,11 @@ func priorityTestPCS(namespace, pcsName string, labels map[string]string) *grove
 func priorityTestPodGang(namespace, podGang, pcsName string) *groveschedulerv1alpha1.PodGang {
 	return &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podGang,
-			Namespace: namespace,
-			UID:       "podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+			Name:        podGang,
+			Namespace:   namespace,
+			UID:         "podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: podGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: pcsName},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: podGang + "-worker", MinReplicas: 1}},

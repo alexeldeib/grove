@@ -37,8 +37,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// newResyncFixture returns a Kueue backend plus the PCS/PodGang it reconciles, used by the
-// evict-and-recreate tests below.
+// newResyncFixture returns a legacy persisted Workload identity plus its PCS/PodGang. These
+// evict-and-recreate tests verify upgrade compatibility; fresh names are covered by identity tests.
 func newResyncFixture(t *testing.T) (client.Client, scheduler.Backend, *grovecorev1alpha1.PodCliqueSet, *groveschedulerv1alpha1.PodGang) {
 	t.Helper()
 	const (
@@ -68,10 +68,11 @@ func newResyncFixture(t *testing.T) (client.Client, scheduler.Backend, *grovecor
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podGang,
-			Namespace: namespace,
-			UID:       "podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+			Name:        podGang,
+			Namespace:   namespace,
+			UID:         "podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: podGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: pcsName},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{{
@@ -627,7 +628,7 @@ func TestPodGangHasNonTerminalPodsUsesDirectClient(t *testing.T) {
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	directClient := testutils.NewTestClientBuilder().WithObjects(oldPod).Build()
+	directClient := testutils.NewTestClientBuilder().WithObjects(oldPod, pg).Build()
 	concrete := backend.(*schedulerBackend)
 	concrete.directClient = directClient
 

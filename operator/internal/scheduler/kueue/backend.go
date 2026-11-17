@@ -19,6 +19,7 @@ package kueue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -60,6 +62,9 @@ const (
 	kueueWorkloadStateCreated        = "created"
 	kueueWorkloadStateRecreate       = "recreate-pending"
 	kueueWorkloadStateDeactivated    = "deactivated"
+	kueueWorkloadNameAnnotation      = "grove.io/kueue-workload-name"
+	kueuePodGangUIDAnnotation        = "grove.io/kueue-podgang-uid"
+	kueuePodGangNameAnnotation       = "grove.io/kueue-podgang-name"
 	// admissionGatedByAnnotation is Kueue's admission gate (KEP-6915, feature AdmissionGatedBy,
 	// beta and on by default from Kueue 0.19). While it lists any gate, Kueue will not reserve quota
 	// for the Workload. Kueue's webhook accepts gates only when the Workload is created; after that
@@ -174,7 +179,7 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 			return err
 		}
 	}
-	existing := newKueueWorkload(podGang.Namespace, podGang.Name)
+	existing := newKueueWorkload(podGang.Namespace, desired.GetName())
 	if err = b.client.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
 		if apierrors.IsNotFound(err) {
 			// The latch check at the top of SyncPodGang reads the cached PodGang, so a reconcile that
@@ -207,13 +212,16 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 			setAdmissionGates(desired, gates)
 			// Choose once per lease, before any member can be created. Even a
 			// finished legacy lease can leave terminal members in the API.
-			mode, modeErr := b.observedPodGroupLifecycle(ctx, podGang, podGroupLifecycleServing)
+			mode, modeErr := b.observedPodGroupLifecycle(ctx, podGang, desired.GetName(), podGroupLifecycleServing)
 			if modeErr != nil {
 				return modeErr
 			}
 			annotations := desired.GetAnnotations()
 			annotations[podGroupLifecycleAnnotation] = mode
 			desired.SetAnnotations(annotations)
+			if err = b.reconcilePredecessorPods(ctx, podGang, desired.GetName()); err != nil {
+				return err
+			}
 			if err = b.client.Create(ctx, desired); err != nil {
 				return fmt.Errorf("failed to create prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
 			}
@@ -272,28 +280,152 @@ func workloadOwnedByPodGang(workload *unstructured.Unstructured, podGang *groves
 	return false
 }
 
+var errPodGangTerminating = errors.New("PodGang is terminating")
+
+// workloadName validates the live incarnation and commits every identity choice before it can
+// reach immutable Pod labels. Concurrent callers converge on the winner of the optimistic write.
+func (b *schedulerBackend) workloadName(ctx context.Context, podGang *groveschedulerv1alpha1.PodGang) (string, error) {
+	var name string
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live := &groveschedulerv1alpha1.PodGang{}
+		if err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(podGang), live); err != nil {
+			return fmt.Errorf("failed to read PodGang before selecting Workload identity: %w", err)
+		}
+		if live.UID != podGang.UID {
+			return fmt.Errorf("PodGang %s/%s is no longer the live incarnation", podGang.Namespace, podGang.Name)
+		}
+		if live.DeletionTimestamp != nil {
+			return fmt.Errorf("PodGang %s/%s: %w", podGang.Namespace, podGang.Name, errPodGangTerminating)
+		}
+		if persisted := live.Annotations[kueueWorkloadNameAnnotation]; persisted != "" {
+			if err := b.validateWorkloadOwner(ctx, live, persisted); err != nil {
+				return err
+			}
+			name = persisted
+			return nil
+		}
+		if live.UID == "" {
+			return fmt.Errorf("PodGang %s/%s has no UID", live.Namespace, live.Name)
+		}
+		name = "grove-" + string(live.UID)
+		legacy := newKueueWorkload(live.Namespace, live.Name)
+		err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(legacy), legacy)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to read legacy Workload identity: %w", err)
+		}
+		if err == nil && workloadOwnedByPodGang(legacy, live) {
+			name = live.Name
+		}
+		if err == nil && !workloadOwnedByPodGang(legacy, live) {
+			retained, err := b.isRetainedGroveWorkload(ctx, legacy, live)
+			if err != nil {
+				return err
+			}
+			if !retained || live.UID == "" {
+				return fmt.Errorf("refusing to use prebuilt kueue Workload %s/%s because it is not owned by PodGang UID %q and predecessor ownership cannot be established", live.Namespace, live.Name, live.UID)
+			}
+			name = "grove-" + string(live.UID)
+		}
+		if err := b.validateWorkloadOwner(ctx, live, name); err != nil {
+			return err
+		}
+		before := live.DeepCopy()
+		if live.Annotations == nil {
+			live.Annotations = map[string]string{}
+		}
+		live.Annotations[kueueWorkloadNameAnnotation] = name
+		// Return the conflict directly so RetryOnConflict re-reads the winning identity.
+		return b.client.Patch(ctx, live, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve Workload identity: %w", err)
+	}
+	return name, nil
+}
+
+func (b *schedulerBackend) validateWorkloadOwner(ctx context.Context, podGang *groveschedulerv1alpha1.PodGang, name string) error {
+	workload := newKueueWorkload(podGang.Namespace, name)
+	if err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(workload), workload); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to validate selected Workload identity: %w", err)
+	}
+	if !workloadOwnedByPodGang(workload, podGang) {
+		return fmt.Errorf("refusing to use prebuilt kueue Workload %s/%s because it is not owned by PodGang UID %q", podGang.Namespace, name, podGang.UID)
+	}
+	return nil
+}
+
+// isRetainedGroveWorkload recognizes predecessors even after GC removes their dangling PodGang
+// owner reference. Older Workloads have no provenance annotations, so verify a surviving Pod
+// owner by UID and all Grove/Kueue enrollment labels before treating the collision as ours.
+func (b *schedulerBackend) isRetainedGroveWorkload(ctx context.Context, workload *unstructured.Unstructured, podGang *groveschedulerv1alpha1.PodGang) (bool, error) {
+	annotations := workload.GetAnnotations()
+	if uid := annotations[kueuePodGangUIDAnnotation]; uid != "" && uid != string(podGang.UID) &&
+		annotations[kueuePodGangNameAnnotation] == podGang.Name {
+		return true, nil
+	}
+	for _, owner := range workload.GetOwnerReferences() {
+		if owner.APIVersion == groveschedulerv1alpha1.SchemeGroupVersion.String() &&
+			owner.Kind == "PodGang" && owner.Name == podGang.Name && owner.UID != "" && owner.UID != podGang.UID {
+			return true, nil
+		}
+		if owner.APIVersion != "v1" || owner.Kind != "Pod" || owner.UID == "" {
+			continue
+		}
+		pod := &corev1.Pod{}
+		if err := b.liveReader().Get(ctx, client.ObjectKey{Namespace: podGang.Namespace, Name: owner.Name}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, fmt.Errorf("failed to verify retained Workload Pod owner: %w", err)
+		}
+		if pod.UID == owner.UID &&
+			pod.Labels[apicommon.LabelManagedByKey] == apicommon.LabelManagedByValue &&
+			podGang.Labels[apicommon.LabelPartOfKey] != "" &&
+			pod.Labels[apicommon.LabelPartOfKey] == podGang.Labels[apicommon.LabelPartOfKey] &&
+			pod.Labels[apicommon.LabelPodGang] == podGang.Name &&
+			pod.Labels[podGroupNameLabel] == workload.GetName() &&
+			pod.Labels[prebuiltWorkloadNameLabel] == workload.GetName() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (b *schedulerBackend) setPodGangWorkloadState(
 	ctx context.Context,
 	podGang *groveschedulerv1alpha1.PodGang,
 	state string,
 ) error {
-	if podGang.Annotations[kueueWorkloadStateAnnotation] == state {
-		return nil
+	// A Workload Create can complete after this PodGang has been replaced. Never let its
+	// completion marker poison the replacement's missing-Workload guard.
+	live := &groveschedulerv1alpha1.PodGang{}
+	if err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(podGang), live); err != nil {
+		return fmt.Errorf("failed to read PodGang before setting Workload state: %w", err)
 	}
-	before := podGang.DeepCopy()
-	if podGang.Annotations == nil {
-		podGang.Annotations = make(map[string]string)
+	if live.UID != podGang.UID || live.DeletionTimestamp != nil {
+		return fmt.Errorf("PodGang %s/%s is no longer the live incarnation", podGang.Namespace, podGang.Name)
 	}
-	podGang.Annotations[kueueWorkloadStateAnnotation] = state
-	if err := b.client.Patch(ctx, podGang, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("failed to set Kueue Workload state %q on PodGang %s/%s: %w", state, podGang.Namespace, podGang.Name, err)
+	if live.Annotations[kueueWorkloadStateAnnotation] != state {
+		before := live.DeepCopy()
+		if live.Annotations == nil {
+			live.Annotations = map[string]string{}
+		}
+		live.Annotations[kueueWorkloadStateAnnotation] = state
+		if err := b.client.Patch(ctx, live, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return fmt.Errorf("failed to set Kueue Workload state %q on PodGang %s/%s: %w", state, podGang.Namespace, podGang.Name, err)
+		}
 	}
+	podGang.Annotations = live.Annotations
+	podGang.ResourceVersion = live.ResourceVersion
 	return nil
 }
 
 // podGangWorkloadStateUncached re-reads the PodGang's Workload state annotation past the informer
 // cache and refreshes the caller's copy with it, so the decisions that follow agree with the API
-// server. A PodGang that no longer exists reports the cached value.
+// server. A deleted or replaced incarnation fails closed.
 func (b *schedulerBackend) podGangWorkloadStateUncached(ctx context.Context, podGang *groveschedulerv1alpha1.PodGang) (string, error) {
 	reader := b.directClient
 	if reader == nil {
@@ -301,10 +433,10 @@ func (b *schedulerBackend) podGangWorkloadStateUncached(ctx context.Context, pod
 	}
 	live := &groveschedulerv1alpha1.PodGang{}
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(podGang), live); err != nil {
-		if apierrors.IsNotFound(err) {
-			return podGang.Annotations[kueueWorkloadStateAnnotation], nil
-		}
 		return "", fmt.Errorf("failed to re-read PodGang %s/%s: %w", podGang.Namespace, podGang.Name, err)
+	}
+	if live.UID != podGang.UID || live.DeletionTimestamp != nil {
+		return "", fmt.Errorf("PodGang %s/%s is no longer the live incarnation", podGang.Namespace, podGang.Name)
 	}
 	state := live.Annotations[kueueWorkloadStateAnnotation]
 	if podGang.Annotations == nil {
@@ -519,7 +651,14 @@ func (b *schedulerBackend) releaseGatedScaledPodGangs(ctx context.Context, baseP
 		if index, ok := pcsReplicaIndexOf(scaled, pcsName); !ok || index != baseReplicaIndex {
 			continue
 		}
-		workload := newKueueWorkload(scaled.Namespace, scaled.Name)
+		name, err := b.workloadName(ctx, scaled)
+		if apierrors.IsNotFound(err) || errors.Is(err, errPodGangTerminating) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		workload := newKueueWorkload(scaled.Namespace, name)
 		key := client.ObjectKeyFromObject(workload)
 		if err = b.client.Get(ctx, key, workload); apierrors.IsNotFound(err) {
 			err = b.liveReader().Get(ctx, key, workload)
@@ -657,6 +796,10 @@ func (b *schedulerBackend) podGangHasNonTerminalPods(
 	ctx context.Context,
 	podGang *groveschedulerv1alpha1.PodGang,
 ) (bool, error) {
+	name, err := b.workloadName(ctx, podGang)
+	if err != nil {
+		return false, err
+	}
 	pods := &corev1.PodList{}
 	reader := b.directClient
 	if reader == nil {
@@ -670,8 +813,8 @@ func (b *schedulerBackend) podGangHasNonTerminalPods(
 			apicommon.LabelManagedByKey: apicommon.LabelManagedByValue,
 			apicommon.LabelPartOfKey:    podGang.Labels[apicommon.LabelPartOfKey],
 			apicommon.LabelPodGang:      podGang.Name,
-			podGroupNameLabel:           podGang.Name,
-			prebuiltWorkloadNameLabel:   podGang.Name,
+			podGroupNameLabel:           name,
+			prebuiltWorkloadNameLabel:   name,
 		},
 	); err != nil {
 		return false, fmt.Errorf("failed to list Pods enrolled in prebuilt Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
@@ -684,6 +827,60 @@ func (b *schedulerBackend) podGangHasNonTerminalPods(
 		}
 	}
 	return false, nil
+}
+
+// reconcilePredecessorPods inventories all prior identities of this named PodGang.
+// Gated Pods from old identities are replaced because Kueue forbids relabeling their group.
+// A unique replacement name must not hide live Pods whose Finished/deleted lease no longer
+// reserves quota. Active predecessors with a reservation retain their own accounting and may drain
+// independently; they do not prevent the replacement from making progress.
+func (b *schedulerBackend) reconcilePredecessorPods(ctx context.Context, podGang *groveschedulerv1alpha1.PodGang, selected string) error {
+	pods := &corev1.PodList{}
+	if err := b.liveReader().List(ctx, pods, client.InNamespace(podGang.Namespace), client.MatchingLabels{
+		apicommon.LabelManagedByKey: apicommon.LabelManagedByValue,
+		apicommon.LabelPartOfKey:    podGang.Labels[apicommon.LabelPartOfKey],
+		apicommon.LabelPodGang:      podGang.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list predecessor admission consumers: %w", err)
+	}
+	checked := map[string]bool{}
+	retiringGatedPods := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		name := pod.Labels[prebuiltWorkloadNameLabel]
+		if name == "" || name == selected || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if podHasSchedulingGate(pod, kueueAdmissionSchedulingGate) {
+			// Kueue makes group labels immutable, so upgrade-era gated Pods cannot be relabeled.
+			// Replacing any gated predecessor is safe: it has consumed no admission. UID and
+			// resourceVersion preconditions reject replacement or admission races after this read.
+			if pod.DeletionTimestamp == nil {
+				uid, version := pod.UID, pod.ResourceVersion
+				if err := b.client.Delete(ctx, pod, client.Preconditions{UID: &uid, ResourceVersion: &version}); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("failed to replace admission-gated predecessor Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+				}
+			}
+			retiringGatedPods = true
+			continue
+		}
+		if checked[name] {
+			continue
+		}
+		workload := newKueueWorkload(podGang.Namespace, name)
+		err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(workload), workload)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to read predecessor Workload %s/%s: %w", podGang.Namespace, name, err)
+		}
+		if apierrors.IsNotFound(err) || workloadFinished(workload) || !workloadActive(workload) || workload.GetDeletionTimestamp() != nil || !workloadHasQuotaReservation(workload) {
+			return fmt.Errorf("waiting for predecessor admission consumers to drain before creating Workload %s/%s: Pod %s still consumes unaccounted Workload %s", podGang.Namespace, selected, pod.Name, name)
+		}
+		checked[name] = true
+	}
+	if retiringGatedPods {
+		return fmt.Errorf("waiting for admission-gated predecessor Pods to be replaced before creating Workload %s/%s", podGang.Namespace, selected)
+	}
+	return nil
 }
 
 func (b *schedulerBackend) deleteWorkload(ctx context.Context, workload *unstructured.Unstructured) error {
@@ -895,8 +1092,16 @@ func (b *schedulerBackend) buildPrebuiltWorkload(ctx context.Context, pcs *grove
 		return nil, fmt.Errorf("PodCliqueSet %s/%s must set label %q for Kueue queue selection", pcs.Namespace, pcs.Name, queueNameLabel)
 	}
 
-	workload := newKueueWorkload(podGang.Namespace, podGang.Name)
-	workload.SetAnnotations(map[string]string{isGroupWorkloadAnnotation: "true"})
+	name, err := b.workloadName(ctx, podGang)
+	if err != nil {
+		return nil, err
+	}
+	workload := newKueueWorkload(podGang.Namespace, name)
+	workload.SetAnnotations(map[string]string{
+		isGroupWorkloadAnnotation:  "true",
+		kueuePodGangUIDAnnotation:  string(podGang.UID),
+		kueuePodGangNameAnnotation: podGang.Name,
+	})
 	if err := unstructured.SetNestedField(workload.Object, true, "spec", "active"); err != nil {
 		return nil, err
 	}
@@ -1032,8 +1237,12 @@ func (b *schedulerBackend) PreparePod(pod *corev1.Pod, preparation scheduler.Pod
 		return fmt.Errorf("PodCliqueSet %s/%s must set label %q for Kueue queue selection", preparation.PodCliqueSet.Namespace, preparation.PodCliqueSet.Name, queueNameLabel)
 	}
 	pod.Labels[queueNameLabel] = queueName
-	pod.Labels[podGroupNameLabel] = preparation.PodGangName
-	pod.Labels[prebuiltWorkloadNameLabel] = preparation.PodGangName
+	name, err := b.workloadName(context.TODO(), preparation.PodGang)
+	if err != nil {
+		return err
+	}
+	pod.Labels[podGroupNameLabel] = name
+	pod.Labels[prebuiltWorkloadNameLabel] = name
 	podGangTotalCount, err := podGangTotalPodCount(preparation.PodCliqueSet, preparation.PodGang)
 	if err != nil {
 		return err
@@ -1044,7 +1253,7 @@ func (b *schedulerBackend) PreparePod(pod *corev1.Pod, preparation scheduler.Pod
 	// records the choice even after every old member has disappeared.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	mode, err := b.podGroupLifecycle(ctx, preparation.PodGang)
+	mode, err := b.podGroupLifecycle(ctx, preparation.PodGang, name)
 	if err != nil {
 		return err
 	}
@@ -1064,13 +1273,15 @@ func (b *schedulerBackend) PreparePod(pod *corev1.Pod, preparation scheduler.Pod
 // podGroupLifecycle migrates unmarked leases using an uncached inventory. An
 // empty existing lease stays legacy: absence of cached/live members is not an
 // activation signal. Optimistic locking serializes simultaneous clique upgrades.
-func (b *schedulerBackend) podGroupLifecycle(ctx context.Context, pg *groveschedulerv1alpha1.PodGang) (string, error) {
-	wl := newKueueWorkload(pg.Namespace, pg.Name)
+// workloadName is the PodGang's selected Workload identity, which differs from
+// the PodGang name for a recreated PodGang.
+func (b *schedulerBackend) podGroupLifecycle(ctx context.Context, pg *groveschedulerv1alpha1.PodGang, workloadName string) (string, error) {
+	wl := newKueueWorkload(pg.Namespace, workloadName)
 	if err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(wl), wl); err != nil {
-		return "", fmt.Errorf("cannot choose pod lifecycle before reading Workload %s/%s: %w", pg.Namespace, pg.Name, err)
+		return "", fmt.Errorf("cannot choose pod lifecycle before reading Workload %s/%s: %w", pg.Namespace, workloadName, err)
 	}
 	if !workloadOwnedByPodGang(wl, pg) || wl.GetDeletionTimestamp() != nil {
-		return "", fmt.Errorf("cannot choose pod lifecycle for unowned or deleting Workload %s/%s", pg.Namespace, pg.Name)
+		return "", fmt.Errorf("cannot choose pod lifecycle for unowned or deleting Workload %s/%s", pg.Namespace, workloadName)
 	}
 	mode := wl.GetAnnotations()[podGroupLifecycleAnnotation]
 	if mode == podGroupLifecycleServing || mode == podGroupLifecycleLegacy {
@@ -1079,7 +1290,7 @@ func (b *schedulerBackend) podGroupLifecycle(ctx context.Context, pg *grovesched
 	if mode != "" {
 		return "", fmt.Errorf("unknown pod lifecycle %q on Workload %s/%s", mode, pg.Namespace, pg.Name)
 	}
-	mode, err := b.observedPodGroupLifecycle(ctx, pg, podGroupLifecycleLegacy)
+	mode, err := b.observedPodGroupLifecycle(ctx, pg, workloadName, podGroupLifecycleLegacy)
 	if err != nil {
 		return "", err
 	}
@@ -1092,14 +1303,17 @@ func (b *schedulerBackend) podGroupLifecycle(ctx context.Context, pg *grovesched
 	// Workload RBAC grants update, not patch. Keep the resourceVersion from
 	// the live read so a competing migration or controller update conflicts.
 	if err := b.client.Update(ctx, wl); err != nil {
-		return "", fmt.Errorf("failed to persist pod lifecycle on Workload %s/%s: %w", pg.Namespace, pg.Name, err)
+		return "", fmt.Errorf("failed to persist pod lifecycle on Workload %s/%s: %w", pg.Namespace, workloadName, err)
 	}
 	return mode, nil
 }
 
-func (b *schedulerBackend) observedPodGroupLifecycle(ctx context.Context, pg *groveschedulerv1alpha1.PodGang, emptyMode string) (string, error) {
+// observedPodGroupLifecycle inventories the members of the selected Workload. A
+// recreated PodGang's predecessor Pods carry the PodGang name instead and are not
+// members of this lease.
+func (b *schedulerBackend) observedPodGroupLifecycle(ctx context.Context, pg *groveschedulerv1alpha1.PodGang, workloadName, emptyMode string) (string, error) {
 	pods := &corev1.PodList{}
-	if err := b.liveReader().List(ctx, pods, client.InNamespace(pg.Namespace), client.MatchingLabels{prebuiltWorkloadNameLabel: pg.Name}); err != nil {
+	if err := b.liveReader().List(ctx, pods, client.InNamespace(pg.Namespace), client.MatchingLabels{prebuiltWorkloadNameLabel: workloadName}); err != nil {
 		return "", fmt.Errorf("failed to inventory lifecycle of PodGang %s/%s: %w", pg.Namespace, pg.Name, err)
 	}
 	mode := ""
