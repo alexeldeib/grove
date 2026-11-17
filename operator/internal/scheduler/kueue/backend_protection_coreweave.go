@@ -24,18 +24,14 @@ const (
 	preemptibleLabel            = "grove.io/kueue-preemptible"
 )
 
-// applyPreemptionProtection classifies the whole gang, never individual pods of
-// a multi-node replica. Baseline protection does not change admission priority.
-// Workloads without explicit configuration remain unlabeled, retaining legacy
-// priority preemption until a replacement revision supplies its floor.
-func applyPreemptionProtection(wl *unstructured.Unstructured, pcs *grovecorev1alpha1.PodCliqueSet, pg *groveschedulerv1alpha1.PodGang) error {
+func protectedReplicaCounts(pcs *grovecorev1alpha1.PodCliqueSet) (map[string]*int32, error) {
 	raw, configured := pcs.Annotations[protectedReplicasAnnotation]
 	if !configured {
-		return nil
+		return nil, nil
 	}
 	var counts map[string]*int32
 	if err := json.Unmarshal([]byte(raw), &counts); err != nil || counts == nil {
-		return fmt.Errorf("invalid %s on PodCliqueSet %s/%s: expected an object of nonnegative replica counts", protectedReplicasAnnotation, pcs.Namespace, pcs.Name)
+		return nil, fmt.Errorf("invalid %s on PodCliqueSet %s/%s: expected an object of nonnegative replica counts", protectedReplicasAnnotation, pcs.Namespace, pcs.Name)
 	}
 	groups := make(map[string]grovecorev1alpha1.PodCliqueScalingGroupConfig)
 	for _, group := range pcs.Spec.Template.PodCliqueScalingGroupConfigs {
@@ -43,8 +39,20 @@ func applyPreemptionProtection(wl *unstructured.Unstructured, pcs *grovecorev1al
 	}
 	for name, count := range counts {
 		if _, found := groups[name]; !found || count == nil || *count < 0 {
-			return fmt.Errorf("invalid protected replica count for scaling group %q on PodCliqueSet %s/%s", name, pcs.Namespace, pcs.Name)
+			return nil, fmt.Errorf("invalid protected replica count for scaling group %q on PodCliqueSet %s/%s", name, pcs.Namespace, pcs.Name)
 		}
+	}
+	return counts, nil
+}
+
+// applyPreemptionProtection classifies the whole gang, never individual pods of
+// a multi-node replica. Baseline protection does not change admission priority.
+// Workloads without explicit configuration remain unlabeled, retaining legacy
+// priority preemption until a replacement revision supplies its floor.
+func applyPreemptionProtection(wl *unstructured.Unstructured, pcs *grovecorev1alpha1.PodCliqueSet, pg *groveschedulerv1alpha1.PodGang) error {
+	counts, err := protectedReplicaCounts(pcs)
+	if err != nil || counts == nil {
+		return err
 	}
 	index, ok := pcsReplicaIndexOf(pg, pcs.Name)
 	if !ok || pg.Labels[apicommon.LabelPartOfKey] != pcs.Name {
@@ -54,7 +62,8 @@ func applyPreemptionProtection(wl *unstructured.Unstructured, pcs *grovecorev1al
 	value := "false"
 	if pg.Name != base {
 		matched := false
-		for name, group := range groups {
+		for _, group := range pcs.Spec.Template.PodCliqueScalingGroupConfigs {
+			name := group.Name
 			suffix, found := strings.CutPrefix(pg.Name, base+"-"+name+"-")
 			if !found {
 				continue

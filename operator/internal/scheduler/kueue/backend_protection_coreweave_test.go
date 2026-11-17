@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -57,6 +58,70 @@ func TestProtectedReplicaClassification(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Equal(t, tc.want, wl.GetLabels()[preemptibleLabel])
+		})
+	}
+}
+
+func TestProtectedReplicaFloorChangesPreserveLease(t *testing.T) {
+	for name, tc := range map[string]struct {
+		before, after, want string
+	}{
+		"increase": {before: `{"worker":1}`, after: `{"worker":2}`, want: "false"},
+		"decrease": {before: `{"worker":2}`, after: `{"worker":1}`, want: "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			cl, backend, pcs, pg := newResyncFixture(t)
+			validator, ok := backend.(*schedulerBackend)
+			require.True(t, ok)
+			pcs.Spec.Template.PodCliqueScalingGroupConfigs = []grovecorev1alpha1.PodCliqueScalingGroupConfig{{
+				Name: "worker", CliqueNames: []string{"worker"}, MinAvailable: ptr.To(int32(1)),
+			}}
+			pcs.Annotations = map[string]string{protectedReplicasAnnotation: tc.before}
+			require.NoError(t, cl.Update(ctx, pcs))
+			pg.Name = "demo-0-worker-0"
+			pg.ResourceVersion = ""
+			pg.UID = "scaled-gang-uid"
+			require.NoError(t, cl.Create(ctx, pg))
+			require.NoError(t, backend.SyncPodGang(ctx, pg))
+			workload := getTestWorkload(t, cl, pg.Namespace, pg.Name)
+			workload.SetUID("lease-uid")
+			workload.Object["status"] = map[string]any{
+				"admission":  map[string]any{"clusterQueue": "queue-a"},
+				"conditions": []any{map[string]any{"type": "QuotaReserved", "status": "True"}},
+			}
+			require.NoError(t, cl.Update(ctx, workload))
+			before := workload.DeepCopy()
+			previous := pcs.DeepCopy()
+			pcs.Annotations[protectedReplicasAnnotation] = tc.after
+			require.NoError(t, validator.ValidatePodCliqueSetUpdate(ctx, previous, pcs))
+			require.NoError(t, cl.Update(ctx, pcs))
+			require.NoError(t, backend.SyncPodGang(ctx, pg))
+			after := getTestWorkload(t, cl, pg.Namespace, pg.Name)
+			require.Equal(t, tc.want, after.GetLabels()[preemptibleLabel])
+			require.Equal(t, before.GetUID(), after.GetUID())
+			require.Equal(t, before.Object["spec"], after.Object["spec"])
+			require.Equal(t, before.Object["status"], after.Object["status"])
+			require.Equal(t, before.GetOwnerReferences(), after.GetOwnerReferences())
+			require.NoError(t, backend.SyncPodGang(ctx, pg))
+			require.Equal(t, after.GetResourceVersion(), getTestWorkload(t, cl, pg.Namespace, pg.Name).GetResourceVersion())
+		})
+	}
+}
+
+func TestProtectedReplicaFloorUpdateValidation(t *testing.T) {
+	for name, raw := range map[string]string{
+		"negative": `{"worker":-1}`, "null": `{"worker":null}`, "unknown group": `{"missing":1}`, "malformed": `{`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, backend, pcs, _ := newResyncFixture(t)
+			validator, ok := backend.(*schedulerBackend)
+			require.True(t, ok)
+			pcs.Spec.Template.PodCliqueScalingGroupConfigs = []grovecorev1alpha1.PodCliqueScalingGroupConfig{{Name: "worker"}}
+			next := pcs.DeepCopy()
+			next.Annotations = map[string]string{protectedReplicasAnnotation: raw}
+			require.Error(t, backend.ValidatePodCliqueSet(context.Background(), next))
+			require.Error(t, validator.ValidatePodCliqueSetUpdate(context.Background(), pcs, next))
 		})
 	}
 }

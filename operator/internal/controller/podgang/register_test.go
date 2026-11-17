@@ -162,6 +162,29 @@ func TestPodCliqueSetChangePredicate(t *testing.T) {
 	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: oldPCS, ObjectNew: newPCS}))
 }
 
+func TestPodCliqueSetProtectionChangesEnqueuePodGangs(t *testing.T) {
+	for name, tc := range map[string]struct {
+		before, after map[string]string
+		want          bool
+	}{
+		"added":     {after: map[string]string{"grove.io/kueue-protected-replicas": `{"w":2}`}, want: true},
+		"changed":   {before: map[string]string{"grove.io/kueue-protected-replicas": `{"w":1}`}, after: map[string]string{"grove.io/kueue-protected-replicas": `{"w":2}`}, want: true},
+		"removed":   {before: map[string]string{"grove.io/kueue-protected-replicas": `{"w":1}`}, want: true},
+		"unrelated": {after: map[string]string{"unrelated": "value"}},
+		"unchanged": {before: map[string]string{"grove.io/kueue-protected-replicas": `{"w":1}`}, after: map[string]string{"grove.io/kueue-protected-replicas": `{"w":1}`}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			oldPCS := &grovecorev1alpha1.PodCliqueSet{ObjectMeta: metav1.ObjectMeta{
+				Labels:      map[string]string{"nvidia.com/dynamo-graph-deployment-name": "graph"},
+				Annotations: tc.before,
+			}}
+			newPCS := oldPCS.DeepCopy()
+			newPCS.Annotations = tc.after
+			require.Equal(t, tc.want, podCliqueSetChangePredicate().Update(event.UpdateEvent{ObjectOld: oldPCS, ObjectNew: newPCS}))
+		})
+	}
+}
+
 func TestKueueWorkloadEvictionPredicate(t *testing.T) {
 	pred := kueueWorkloadEvictionPredicate()
 	running := newKueueWorkloadType()
