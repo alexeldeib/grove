@@ -16,6 +16,7 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -37,6 +38,20 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
+
+type fakePodCliqueSetUpdateValidatingBackend struct {
+	scheduler.Backend
+	err    error
+	called bool
+}
+
+func (b *fakePodCliqueSetUpdateValidatingBackend) ValidatePodCliqueSetUpdate(
+	_ context.Context,
+	_, _ *grovecorev1alpha1.PodCliqueSet,
+) error {
+	b.called = true
+	return b.err
+}
 
 // TestNewHandler tests the creation of a new validation handler.
 func TestNewHandler(t *testing.T) {
@@ -384,6 +399,33 @@ func TestValidateUpdate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateUpdateInvokesSchedulerBackendUpdateValidation(t *testing.T) {
+	cl := testutils.NewTestClientBuilder().Build()
+	mgr := &testutils.FakeManager{Client: cl, Scheme: cl.Scheme(), Logger: logr.Discard()}
+	backend := &fakePodCliqueSetUpdateValidatingBackend{
+		Backend: testutils.NewFakeSchedulerBackend("default-scheduler"),
+		err:     errors.New("unsafe scheduler update"),
+	}
+	registry := &testutils.FakeSchedulerRegistry{
+		Backends:       map[string]scheduler.Backend{"default-scheduler": backend},
+		DefaultBackend: "default-scheduler",
+	}
+	cfg := groveconfigv1alpha1.OperatorConfiguration{
+		TopologyAwareScheduling: getDefaultTASConfig(),
+		Network:                 getDefaultNetworkConfig(),
+		Scheduler: groveconfigv1alpha1.SchedulerConfiguration{
+			Profiles:           []groveconfigv1alpha1.SchedulerProfile{{Name: groveconfigv1alpha1.SchedulerNameKube}},
+			DefaultProfileName: string(groveconfigv1alpha1.SchedulerNameKube),
+		},
+	}
+	oldPCS := createTestPodCliqueSet("test")
+	newPCS := oldPCS.DeepCopy()
+
+	_, err := NewHandler(mgr, &cfg, registry).ValidateUpdate(t.Context(), oldPCS, newPCS)
+	require.ErrorContains(t, err, "unsafe scheduler update")
+	assert.True(t, backend.called)
 }
 
 // TestValidateDelete tests validation of PodCliqueSet deletion requests.

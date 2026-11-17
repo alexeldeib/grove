@@ -80,19 +80,28 @@ func newKueueWorkloadType() *unstructured.Unstructured {
 	return workload
 }
 
-// kueueWorkloadEvictionPredicate enqueues the owning PodGang when its prebuilt Workload is deleted (so
-// SyncPodGang recreates it) or when Kueue finalizes it (so SyncPodGang evicts it). Grove writes only the
-// Workload spec and metadata, never its status, so reacting to the Finished transition cannot feed back
-// into a reconcile loop.
+// kueueWorkloadEvictionPredicate enqueues the owning PodGang when its prebuilt Workload is deleted, when
+// Kueue finalizes it, or when Kueue deactivates it and releases admission accounting. Grove must observe
+// those transitions without reactivating or replacing the lease while old Pods may still exist.
 func kueueWorkloadEvictionPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(_ event.CreateEvent) bool { return false },
 		DeleteFunc: func(_ event.DeleteEvent) bool { return true },
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return kueueWorkloadFinished(e.ObjectNew) && !kueueWorkloadFinished(e.ObjectOld)
+			return kueueWorkloadFinished(e.ObjectNew) && !kueueWorkloadFinished(e.ObjectOld) ||
+				kueueWorkloadActive(e.ObjectOld) && !kueueWorkloadActive(e.ObjectNew)
 		},
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}
+}
+
+func kueueWorkloadActive(obj client.Object) bool {
+	workload, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return true
+	}
+	active, found, err := unstructured.NestedBool(workload.Object, "spec", "active")
+	return err == nil && (!found || active)
 }
 
 // kueueWorkloadFinished reports whether the Workload carries a Finished=True status condition.

@@ -113,6 +113,11 @@ func (h *Handler) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Obj
 	if err := h.validatePodCliqueSetWithBackend(ctx, newPCS); err != nil {
 		errs = append(errs, field.Invalid(field.NewPath("spec"), newPCS.Spec, err.Error()))
 	}
+	if len(errs) == 0 {
+		if err := h.validatePodCliqueSetUpdateWithBackend(ctx, oldPCS, newPCS); err != nil {
+			errs = append(errs, field.Invalid(field.NewPath("spec"), newPCS.Spec, err.Error()))
+		}
+	}
 
 	if len(errs) > 0 {
 		return warnings, errs.ToAggregate()
@@ -130,6 +135,29 @@ func (h *Handler) ValidateDelete(_ context.Context, _ runtime.Object) (admission
 // validatePodCliqueSetWithBackend resolves the scheduler backend for the PCS and runs backend-specific validation.
 // All cliques share the same (resolved) schedulerName after validateSchedulerNames, so we use the first clique.
 func (h *Handler) validatePodCliqueSetWithBackend(ctx context.Context, pcs *v1alpha1.PodCliqueSet) error {
+	backend, err := h.backendForPodCliqueSet(pcs)
+	if err != nil {
+		return err
+	}
+	return backend.ValidatePodCliqueSet(ctx, pcs)
+}
+
+func (h *Handler) validatePodCliqueSetUpdateWithBackend(
+	ctx context.Context,
+	oldPCS, newPCS *v1alpha1.PodCliqueSet,
+) error {
+	backend, err := h.backendForPodCliqueSet(newPCS)
+	if err != nil {
+		return err
+	}
+	validator, ok := backend.(scheduler.PodCliqueSetUpdateValidator)
+	if !ok {
+		return nil
+	}
+	return validator.ValidatePodCliqueSetUpdate(ctx, oldPCS, newPCS)
+}
+
+func (h *Handler) backendForPodCliqueSet(pcs *v1alpha1.PodCliqueSet) (scheduler.Backend, error) {
 	schedulerName := ""
 	if len(pcs.Spec.Template.Cliques) > 0 && pcs.Spec.Template.Cliques[0] != nil {
 		schedulerName = pcs.Spec.Template.Cliques[0].Spec.PodSpec.SchedulerName
@@ -138,11 +166,11 @@ func (h *Handler) validatePodCliqueSetWithBackend(ctx context.Context, pcs *v1al
 	backend := h.schedRegistry.GetOrDefault(schedulerName)
 	if backend == nil {
 		if schedulerName == "" {
-			return fmt.Errorf("default scheduler backend is not configured")
+			return nil, fmt.Errorf("default scheduler backend is not configured")
 		}
-		return fmt.Errorf("schedulerName %q is not enabled in OperatorConfiguration", schedulerName)
+		return nil, fmt.Errorf("schedulerName %q is not enabled in OperatorConfiguration", schedulerName)
 	}
-	return backend.ValidatePodCliqueSet(ctx, pcs)
+	return backend, nil
 }
 
 // castToPodCliqueSet attempts to cast a runtime.Object to a PodCliqueSet.
