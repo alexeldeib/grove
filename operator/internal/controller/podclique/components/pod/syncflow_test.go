@@ -38,6 +38,29 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+func TestSyncExpectationsAndComputeDifferenceRestoresTerminatingPodsAfterRestart(t *testing.T) {
+	deletionTimestamp := metav1.Now()
+	pods := []*corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{UID: "live-1"}},
+		{ObjectMeta: metav1.ObjectMeta{UID: "live-2"}},
+		{ObjectMeta: metav1.ObjectMeta{UID: "live-3"}},
+		{ObjectMeta: metav1.ObjectMeta{UID: "terminating", DeletionTimestamp: &deletionTimestamp}},
+	}
+	r := &_resource{expectationsStore: expect.NewExpectationsStore()}
+	sc := &syncContext{
+		pclq: &grovecorev1alpha1.PodClique{
+			Spec: grovecorev1alpha1.PodCliqueSpec{Replicas: 4},
+		},
+		existingPCLQPods:         pods,
+		pclqExpectationsStoreKey: "default/test",
+	}
+
+	diff := r.syncExpectationsAndComputeDifference(logr.Discard(), sc)
+
+	assert.Equal(t, -1, diff, "the terminating Pod must be replaced after an operator restart")
+	assert.ElementsMatch(t, []types.UID{"terminating"}, r.expectationsStore.GetDeleteExpectations(sc.pclqExpectationsStoreKey))
+}
+
 func TestCheckAndRemovePodSchedulingGates_MinAvailableAware(t *testing.T) {
 	tests := []struct {
 		name                string
