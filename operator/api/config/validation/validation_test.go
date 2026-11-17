@@ -207,6 +207,17 @@ func TestValidateSchedulerConfiguration(t *testing.T) {
 			},
 			expectErrors: 0,
 		},
+		{
+			name: "valid: binpack and kube profiles with kube default",
+			scheduler: &configv1alpha1.SchedulerConfiguration{
+				Profiles: []configv1alpha1.SchedulerProfile{
+					{Name: configv1alpha1.SchedulerNameKube},
+					{Name: configv1alpha1.SchedulerNameBinpack},
+				},
+				DefaultProfileName: string(configv1alpha1.SchedulerNameKube),
+			},
+			expectErrors: 0,
+		},
 		// single kai without kube → invalid because default-scheduler profile is always required
 		{
 			name: "invalid: single kai without kube profile",

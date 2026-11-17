@@ -49,6 +49,12 @@ func TestNewRegistry(t *testing.T) {
 			expectedName:  "default-scheduler",
 		},
 		{
+			name:          "binpack scheduler initialization",
+			schedulerName: configv1alpha1.SchedulerNameBinpack,
+			wantErr:       false,
+			expectedName:  "binpack-scheduler",
+		},
+		{
 			name:          "lpx scheduler initialization",
 			schedulerName: configv1alpha1.SchedulerNameLPX,
 			wantErr:       false,
@@ -97,6 +103,7 @@ func TestNewRegistry(t *testing.T) {
 		cfg := configv1alpha1.SchedulerConfiguration{
 			Profiles: []configv1alpha1.SchedulerProfile{
 				{Name: configv1alpha1.SchedulerNameKube},
+				{Name: configv1alpha1.SchedulerNameBinpack},
 				{Name: configv1alpha1.SchedulerNameKai},
 				{Name: configv1alpha1.SchedulerNameVolcano},
 				{Name: configv1alpha1.SchedulerNameLPX},
@@ -107,10 +114,16 @@ func TestNewRegistry(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, reg.Get(string(configv1alpha1.SchedulerNameKai)))
 		require.NotNil(t, reg.Get(string(configv1alpha1.SchedulerNameKube)))
+		binpackBackend := reg.Get(string(configv1alpha1.SchedulerNameBinpack))
+		require.NotNil(t, binpackBackend)
 		require.NotNil(t, reg.Get(string(configv1alpha1.SchedulerNameVolcano)))
 		require.NotNil(t, reg.Get(string(configv1alpha1.SchedulerNameLPX)))
 		assert.Equal(t, reg.GetDefault(), reg.Get(string(configv1alpha1.SchedulerNameKai)))
 		assert.NotContains(t, reg.AllTopologyAware(), string(configv1alpha1.SchedulerNameLPX))
+
+		pod := testutils.NewPodBuilder("test-pod", "default").Build()
+		require.NoError(t, binpackBackend.PreparePod(pod, scheduler.PodPreparationContext{}))
+		assert.Equal(t, string(configv1alpha1.SchedulerNameBinpack), pod.Spec.SchedulerName)
 	})
 
 	t.Run("volcano scheduler initialization", func(t *testing.T) {

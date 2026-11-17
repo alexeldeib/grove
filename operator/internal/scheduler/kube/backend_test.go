@@ -27,14 +27,18 @@ import (
 )
 
 func TestBackend_PreparePod(t *testing.T) {
-	cl := testutils.CreateDefaultFakeClient(nil)
-	recorder := record.NewFakeRecorder(10)
-	profile := configv1alpha1.SchedulerProfile{Name: configv1alpha1.SchedulerNameKube}
-	b := New(cl, cl.Scheme(), recorder, profile)
+	for _, schedulerName := range []configv1alpha1.SchedulerName{
+		configv1alpha1.SchedulerNameKube,
+		configv1alpha1.SchedulerNameBinpack,
+	} {
+		t.Run(string(schedulerName), func(t *testing.T) {
+			cl := testutils.CreateDefaultFakeClient(nil)
+			profile := configv1alpha1.SchedulerProfile{Name: schedulerName}
+			backend := New(cl, cl.Scheme(), record.NewFakeRecorder(10), profile)
 
-	pod := testutils.NewPodBuilder("test-pod", "default").Build()
-
-	require.NoError(t, b.PreparePod(pod, scheduler.PodPreparationContext{}))
-
-	assert.Equal(t, string(configv1alpha1.SchedulerNameKube), pod.Spec.SchedulerName)
+			pod := testutils.NewPodBuilder("test-pod", "default").Build()
+			require.NoError(t, backend.PreparePod(pod, scheduler.PodPreparationContext{}))
+			assert.Equal(t, string(schedulerName), pod.Spec.SchedulerName)
+		})
+	}
 }
