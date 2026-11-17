@@ -51,6 +51,12 @@ const (
 	isGroupWorkloadAnnotation        = "kueue.x-k8s.io/is-group-workload"
 	roleHashAnnotation               = "kueue.x-k8s.io/role-hash"
 	kueueAdmissionDisabledAnnotation = "grove.io/kueue-admission-disabled"
+	priorityClassNameLabel           = "kueue.x-k8s.io/priority-class"
+)
+
+const (
+	workloadPriorityClassGroup = "kueue.x-k8s.io"
+	workloadPriorityClassKind  = "WorkloadPriorityClass"
 )
 
 const podSetUnconstrainedTopologyAnnotation = "kueue.x-k8s.io/podset-unconstrained-topology"
@@ -59,6 +65,12 @@ var workloadGVK = schema.GroupVersionKind{
 	Group:   "kueue.x-k8s.io",
 	Version: "v1beta2",
 	Kind:    "Workload",
+}
+
+var workloadPriorityClassGVK = schema.GroupVersionKind{
+	Group:   workloadPriorityClassGroup,
+	Version: "v1beta2",
+	Kind:    workloadPriorityClassKind,
 }
 
 type schedulerBackend struct {
@@ -113,7 +125,7 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 		return fmt.Errorf("failed to get PodCliqueSet %s/%s for PodGang %s: %w", podGang.Namespace, pcsName, podGang.Name, err)
 	}
 
-	desired, err := b.buildPrebuiltWorkload(pcs, podGang)
+	desired, err := b.buildPrebuiltWorkload(ctx, pcs, podGang)
 	if err != nil {
 		return err
 	}
@@ -233,7 +245,7 @@ func workloadFinished(workload *unstructured.Unstructured) bool {
 // podSet. The podSet name is the PodGroup FQN so scaling-group replicas of the same clique stay unique. count
 // is the clique replicas; minCount is the PodGroup minReplicas for standalone cliques and is forced to count
 // for scaling-group cliques (POC assumption PCSG.minAvailable == PCSG.replicas).
-func (b *schedulerBackend) buildPrebuiltWorkload(pcs *grovecorev1alpha1.PodCliqueSet, podGang *groveschedulerv1alpha1.PodGang) (*unstructured.Unstructured, error) {
+func (b *schedulerBackend) buildPrebuiltWorkload(ctx context.Context, pcs *grovecorev1alpha1.PodCliqueSet, podGang *groveschedulerv1alpha1.PodGang) (*unstructured.Unstructured, error) {
 	queueName := pcs.Labels[queueNameLabel]
 	if queueName == "" {
 		return nil, fmt.Errorf("PodCliqueSet %s/%s must set label %q for Kueue queue selection", pcs.Namespace, pcs.Name, queueNameLabel)
@@ -320,12 +332,50 @@ func (b *schedulerBackend) buildPrebuiltWorkload(pcs *grovecorev1alpha1.PodCliqu
 	if err := unstructured.SetNestedSlice(workload.Object, podSets, "spec", "podSets"); err != nil {
 		return nil, err
 	}
+	if err := b.applyWorkloadPriority(ctx, workload, pcs); err != nil {
+		return nil, err
+	}
 	// Own the Workload by the PodGang so Kubernetes garbage collection removes it once the PodGang and all
 	// member Pods (which Kueue adds as owners on admission) are gone.
 	if err := controllerutil.SetOwnerReference(podGang, workload, b.scheme); err != nil {
 		return nil, fmt.Errorf("failed to set owner reference on prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
 	}
 	return workload, nil
+}
+
+// applyWorkloadPriority resolves the WorkloadPriorityClass named by the PodCliqueSet's priority-class
+// label and stamps both priorityClassRef and priority on the Workload. Kueue only populates priority
+// from the class for Workloads it builds from a Job; Grove owns the prebuilt Workload, and the API
+// requires priority to be set whenever priorityClassRef is, so it is resolved here. A missing label
+// leaves the Workload at the default priority.
+func (b *schedulerBackend) applyWorkloadPriority(ctx context.Context, workload *unstructured.Unstructured, pcs *grovecorev1alpha1.PodCliqueSet) error {
+	name := pcs.Labels[priorityClassNameLabel]
+	if name == "" {
+		return nil
+	}
+
+	wpc := &unstructured.Unstructured{}
+	wpc.SetGroupVersionKind(workloadPriorityClassGVK)
+	if err := b.client.Get(ctx, client.ObjectKey{Name: name}, wpc); err != nil {
+		return fmt.Errorf("failed to get WorkloadPriorityClass %q for PodCliqueSet %s/%s: %w", name, pcs.Namespace, pcs.Name, err)
+	}
+	value, found, err := unstructured.NestedInt64(wpc.Object, "value")
+	if err != nil {
+		return fmt.Errorf("WorkloadPriorityClass %q has a non-integer value: %w", name, err)
+	}
+	if !found {
+		return fmt.Errorf("WorkloadPriorityClass %q is missing the required value field", name)
+	}
+
+	priorityClassRef := map[string]any{
+		"group": workloadPriorityClassGroup,
+		"kind":  workloadPriorityClassKind,
+		"name":  name,
+	}
+	if err := unstructured.SetNestedMap(workload.Object, priorityClassRef, "spec", "priorityClassRef"); err != nil {
+		return err
+	}
+	return unstructured.SetNestedField(workload.Object, value, "spec", "priority")
 }
 
 // topologyGroupNameForPodGroup returns the Grove topology constraint group that contains the PodGroup.
