@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -400,4 +401,42 @@ func nestedString(t *testing.T, obj *unstructured.Unstructured, fields ...string
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+// TestIndependentKueueProfiles ensures the alias retains Kueue enrollment while selecting its own underlying scheduler.
+func TestIndependentKueueProfiles(t *testing.T) {
+	pcs := &grovecorev1alpha1.PodCliqueSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default", Labels: map[string]string{queueNameLabel: "queue-a"}},
+		Spec: grovecorev1alpha1.PodCliqueSetSpec{Template: grovecorev1alpha1.PodCliqueSetTemplateSpec{
+			Cliques: []*grovecorev1alpha1.PodCliqueTemplateSpec{{Name: "worker", Spec: grovecorev1alpha1.PodCliqueSpec{Replicas: 1}}},
+		}},
+	}
+	pg := &groveschedulerv1alpha1.PodGang{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default"},
+		Spec:       groveschedulerv1alpha1.PodGangSpec{PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: "demo-0-worker", MinReplicas: 1}}},
+	}
+	cl := testutils.NewTestClientBuilder().WithObjects(pcs, pg).Build()
+	for _, tc := range []struct {
+		name       configv1alpha1.SchedulerName
+		underlying string
+	}{
+		{configv1alpha1.SchedulerNameKueue, "binpack-scheduler"},
+		{configv1alpha1.SchedulerNameKueueDefault, "default-scheduler"},
+	} {
+		t.Run(string(tc.name), func(t *testing.T) {
+			profile := configv1alpha1.SchedulerProfile{Name: tc.name, Config: &runtime.RawExtension{Raw: []byte(`{"underlyingSchedulerName":"` + tc.underlying + `"}`)}}
+			backend := New(cl, cl.Scheme(), record.NewFakeRecorder(10), profile)
+			require.NoError(t, backend.Init(nil))
+			assert.Equal(t, string(tc.name), backend.Name())
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
+			require.NoError(t, backend.PreparePod(pod, scheduler.PodPreparationContext{
+				PodCliqueSet: pcs, PodClique: &grovecorev1alpha1.PodClique{ObjectMeta: metav1.ObjectMeta{Name: "demo-0-worker", Namespace: "default"}},
+				PodGang: pg, PodGangName: pg.Name,
+			}))
+			assert.Equal(t, tc.underlying, pod.Spec.SchedulerName)
+			assert.Equal(t, "queue-a", pod.Labels[queueNameLabel])
+			assert.Equal(t, pg.Name, pod.Labels[prebuiltWorkloadNameLabel])
+			assert.Equal(t, "1", pod.Annotations[podGroupTotalCountAnnotation])
+		})
+	}
 }

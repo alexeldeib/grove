@@ -18,12 +18,17 @@ import (
 	"testing"
 
 	configv1alpha1 "github.com/ai-dynamo/grove/operator/api/config/v1alpha1"
+	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	"github.com/ai-dynamo/grove/operator/internal/scheduler"
 	testutils "github.com/ai-dynamo/grove/operator/test/utils"
 	schedulertest "github.com/ai-dynamo/grove/operator/test/utils/scheduler"
+	groveschedulerv1alpha1 "github.com/ai-dynamo/grove/scheduler/api/core/v1alpha1"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 )
 
@@ -59,6 +64,11 @@ func TestNewRegistry(t *testing.T) {
 			schedulerName: configv1alpha1.SchedulerNameLPX,
 			wantErr:       false,
 			expectedName:  "lpx-scheduler",
+		},
+		{
+			name:          "kueue default scheduler initialization",
+			schedulerName: configv1alpha1.SchedulerNameKueueDefault,
+			expectedName:  "kueue-default",
 		},
 		{
 			name:          "unsupported scheduler",
@@ -319,4 +329,38 @@ func TestAllTopologyAware(t *testing.T) {
 		assert.NotNil(t, result)
 		assert.Empty(t, result)
 	})
+}
+
+// Both profiles must remain independently addressable after registry initialization.
+func TestIndependentKueueProfiles(t *testing.T) {
+	cl := testutils.NewTestClientBuilder().Build()
+	cfg := configv1alpha1.SchedulerConfiguration{
+		DefaultProfileName: string(configv1alpha1.SchedulerNameKube),
+		Profiles: []configv1alpha1.SchedulerProfile{
+			{Name: configv1alpha1.SchedulerNameKube},
+			{Name: configv1alpha1.SchedulerNameKueue, Config: &runtime.RawExtension{Raw: []byte(`{"underlyingSchedulerName":"binpack-scheduler"}`)}},
+			{Name: configv1alpha1.SchedulerNameKueueDefault, Config: &runtime.RawExtension{Raw: []byte(`{"underlyingSchedulerName":"default-scheduler"}`)}},
+		},
+	}
+	reg, err := New(cl, cl, cl.Scheme(), record.NewFakeRecorder(10), cfg)
+	require.NoError(t, err)
+	require.Len(t, reg.All(), 3)
+	require.Contains(t, reg.AllTopologyAware(), "kueue")
+	require.Contains(t, reg.AllTopologyAware(), "kueue-default")
+	assert.NotSame(t, reg.Get("kueue"), reg.Get("kueue-default"))
+	pcs := &grovecorev1alpha1.PodCliqueSet{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default", Labels: map[string]string{"kueue.x-k8s.io/queue-name": "queue-a"}}}
+	pcs.Spec.Template.Cliques = []*grovecorev1alpha1.PodCliqueTemplateSpec{{Name: "worker", Spec: grovecorev1alpha1.PodCliqueSpec{Replicas: 1}}}
+	pg := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default"}, Spec: groveschedulerv1alpha1.PodGangSpec{PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: "demo-0-worker", MinReplicas: 1}}}}
+	for name, underlying := range map[string]string{"kueue": "binpack-scheduler", "kueue-default": "default-scheduler"} {
+		t.Run(name, func(t *testing.T) {
+			b := reg.Get(name)
+			require.NotNil(t, b)
+			assert.Equal(t, name, b.Name())
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
+			require.NoError(t, b.PreparePod(pod, scheduler.PodPreparationContext{PodCliqueSet: pcs, PodClique: &grovecorev1alpha1.PodClique{ObjectMeta: metav1.ObjectMeta{Name: "demo-0-worker", Namespace: "default"}}, PodGang: pg, PodGangName: pg.Name}))
+			assert.Equal(t, underlying, pod.Spec.SchedulerName)
+			assert.Equal(t, "queue-a", pod.Labels["kueue.x-k8s.io/queue-name"])
+			assert.Equal(t, pg.Name, pod.Labels["kueue.x-k8s.io/prebuilt-workload-name"])
+		})
+	}
 }
