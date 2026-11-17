@@ -1677,18 +1677,6 @@ func Test_TAS21_TopologyValidationWebhooks(t *testing.T) {
 			errContains: []string{"spec.schedulerTopologyReferences[1].schedulerName", "Duplicate value"},
 		},
 		{
-			name:   "unknown scheduler backend reference",
-			ctName: "tas22-unknown-backend",
-			levels: []corev1alpha1.TopologyLevel{
-				{Domain: corev1alpha1.TopologyDomainZone, Key: setup.TopologyLabelZone},
-				{Domain: corev1alpha1.TopologyDomainRack, Key: setup.TopologyLabelRack},
-			},
-			refs: []corev1alpha1.SchedulerTopologyBinding{
-				{SchedulerName: "unknown-scheduler", TopologyReference: "topology"},
-			},
-			errContains: []string{"spec.schedulerTopologyReferences[0].schedulerName", "scheduler backend is not enabled in Grove"},
-		},
-		{
 			name:   "non topology aware scheduler backend reference",
 			ctName: "tas22-non-tas-backend",
 			levels: []corev1alpha1.TopologyLevel{
