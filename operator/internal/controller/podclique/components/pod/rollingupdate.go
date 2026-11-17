@@ -21,6 +21,7 @@ import (
 
 	"github.com/ai-dynamo/grove/operator/api/common"
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
+	"github.com/ai-dynamo/grove/operator/internal/constants"
 	"github.com/ai-dynamo/grove/operator/internal/controller/common/component"
 	componentutils "github.com/ai-dynamo/grove/operator/internal/controller/common/component/utils"
 	groveerr "github.com/ai-dynamo/grove/operator/internal/errors"
@@ -43,7 +44,8 @@ type updateWork struct {
 	oldTemplateHashStartingPods      []*corev1.Pod // pods with old hash whose containers have not yet passed startup probe
 	oldTemplateHashUncategorizedPods []*corev1.Pod // pods with old hash in an unrecognized state
 	oldTemplateHashReadyPods         []*corev1.Pod // pods with old hash that are fully ready and serving traffic
-	newTemplateHashReadyPods         []*corev1.Pod // pods with new hash that are fully ready
+	newTemplateHashReadyPods         []*corev1.Pod // pods with new hash that are fully ready (excluding those already terminating)
+	newTemplateHashUnhealthyPods     []*corev1.Pod // pods with new hash that have exited erroneously (crash-looping replacements)
 }
 
 // getPodNamesPendingUpdate returns names of pods with old template hash that are not already being deleted
@@ -129,7 +131,31 @@ func (r _resource) processPendingUpdates(logger logr.Logger, sc *syncContext) er
 		)
 	}
 
-	// If the control comes here, then mark the end of update.
+	// Old non-ready pods are deleted eagerly and do not go through the
+	// ready-pod selection flow above. Wait for every desired replacement to
+	// become Ready before closing the update, otherwise UpdateEndedAt can be
+	// set while the new generation is still starting or crash-looping.
+	if int32(len(updateWork.newTemplateHashReadyPods)) < pclq.Spec.Replicas {
+		// Holding the update open forces MinAvailableBreached=Unknown and suppresses breach-driven
+		// remediation, so a crash-looping new generation would otherwise stall silently. Emit a
+		// Warning so the stalled rollout is observable; the recorder aggregates repeats.
+		if len(updateWork.newTemplateHashUnhealthyPods) > 0 {
+			r.eventRecorder.Eventf(pclq, corev1.EventTypeWarning, constants.ReasonRollingUpdateStalled,
+				"Rolling update stalled: %d/%d updated pods ready, unhealthy updated pods: %v",
+				len(updateWork.newTemplateHashReadyPods), pclq.Spec.Replicas,
+				componentutils.PodsToObjectNames(updateWork.newTemplateHashUnhealthyPods))
+		}
+		return groveerr.New(
+			groveerr.ErrCodeContinueReconcileAndRequeue,
+			component.OperationSync,
+			fmt.Sprintf(
+				"waiting for updated pods to become ready before marking update end: %d ready, need %d",
+				len(updateWork.newTemplateHashReadyPods),
+				pclq.Spec.Replicas,
+			),
+		)
+	}
+
 	return r.markRollingUpdateEnd(sc.ctx, logger, pclq)
 }
 
@@ -160,10 +186,21 @@ func (r _resource) computeUpdateWork(logger logr.Logger, sc *syncContext) *updat
 				work.oldTemplateHashUncategorizedPods = append(work.oldTemplateHashUncategorizedPods, pod)
 			}
 		} else {
-			// New-hash pod — only count as ready; non-ready pods are not tracked so
-			// isCurrentPodUpdateComplete won't prematurely declare success.
-			if k8sutils.IsPodReady(pod) {
+			// New-hash pod — skip if deletion is already in flight so a Ready-but-terminating
+			// replacement (manually deleted, or racing deleteExcessPods) can't satisfy the
+			// completion gate a step early.
+			if r.hasPodDeletionBeenTriggered(sc, pod) {
+				continue
+			}
+			// Count ready replacements for the completion gate; non-ready pods are otherwise
+			// not tracked so isCurrentPodUpdateComplete won't prematurely declare success.
+			// Crash-looping replacements are tracked separately purely to surface a stall
+			// signal (see processPendingUpdates) — they do not affect the completion gate.
+			switch {
+			case k8sutils.IsPodReady(pod):
 				work.newTemplateHashReadyPods = append(work.newTemplateHashReadyPods, pod)
+			case k8sutils.HasAnyContainerExitedErroneously(logger, pod):
+				work.newTemplateHashUnhealthyPods = append(work.newTemplateHashUnhealthyPods, pod)
 			}
 		}
 	}

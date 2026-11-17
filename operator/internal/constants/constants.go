@@ -46,6 +46,9 @@ const (
 	ReasonPodDeleteSuccessful = "PodDeleteSuccessful"
 	// ReasonPodDeleteFailed is an event reason which represents that the deletion of a Pod failed.
 	ReasonPodDeleteFailed = "PodDeleteFailed"
+	// ReasonRollingUpdateStalled is an event reason which represents that a rolling update is held open because a
+	// replacement Pod on the new template hash is crash-looping or exiting erroneously.
+	ReasonRollingUpdateStalled = "RollingUpdateStalled"
 )
 
 // constants for PodClique lifecycle events
