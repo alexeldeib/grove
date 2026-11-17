@@ -61,6 +61,13 @@ type PodCliqueSetUpdateValidator interface {
 	) error
 }
 
+// Finalizer is implemented by backends whose serving pods need explicit cleanup.
+// IsPodFinalized determines when an old pod no longer occupies a replacement slot.
+type Finalizer interface {
+	RemovePodFinalizers(context.Context, *corev1.Pod) error
+	IsPodFinalized(*corev1.Pod) bool
+}
+
 // PodPreparationContext contains the Grove resources associated with a Pod being prepared.
 type PodPreparationContext struct {
 	PodCliqueSet *grovecorev1alpha1.PodCliqueSet

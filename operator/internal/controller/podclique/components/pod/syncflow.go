@@ -28,6 +28,7 @@ import (
 	groveerr "github.com/ai-dynamo/grove/operator/internal/errors"
 	"github.com/ai-dynamo/grove/operator/internal/expect"
 	"github.com/ai-dynamo/grove/operator/internal/index"
+	"github.com/ai-dynamo/grove/operator/internal/scheduler"
 	"github.com/ai-dynamo/grove/operator/internal/utils"
 	k8sutils "github.com/ai-dynamo/grove/operator/internal/utils/kubernetes"
 
@@ -99,6 +100,9 @@ func (r _resource) prepareSyncFlow(ctx context.Context, logger logr.Logger, pclq
 		)
 	}
 
+	if err := r.prepareServingRecovery(sc); err != nil {
+		return nil, err
+	}
 	return sc, nil
 }
 
@@ -133,10 +137,19 @@ func (r _resource) getPodNamesUpdatedInAssociatedPodGang(existingPodGang *groves
 // runSyncFlow executes the main synchronization logic including pod creation, deletion, updates, and scheduling gate management
 func (r _resource) runSyncFlow(logger logr.Logger, sc *syncContext) syncFlowResult {
 	result := syncFlowResult{}
+	if err := r.removeSchedulerFinalizersFromDeletingPods(sc); err != nil {
+		result.recordError(err)
+		return result
+	}
 	if err := r.deleteTerminalPods(sc, logger); err != nil {
 		result.recordError(err)
 	}
 	diff := r.syncExpectationsAndComputeDifference(logger, sc)
+	if adjusted, waiting := r.withholdUnfinalizedReplacements(sc, diff); waiting {
+		diff = adjusted
+		result.recordError(groveerr.New(groveerr.ErrCodeRequeueAfter, component.OperationSync,
+			"waiting for old Kueue pods to terminate before replacing their admission slots"))
+	}
 	if diff < 0 {
 		logger.Info("found fewer pods than desired", "pclq.spec.replicas", sc.pclq.Spec.Replicas, "delta", diff)
 		diff *= -1
@@ -499,6 +512,8 @@ type syncContext struct {
 	pclq                            *grovecorev1alpha1.PodClique
 	associatedPodGangName           string
 	existingPCLQPods                []*corev1.Pod
+	predecessorPods                 []*corev1.Pod
+	finalizer                       scheduler.Finalizer
 	podNamesUpdatedInPCLQPodGangs   []string
 	podNamesUpdatedInPCLQPodGangSet componentutils.Set[string]
 	pclqExpectationsStoreKey        string

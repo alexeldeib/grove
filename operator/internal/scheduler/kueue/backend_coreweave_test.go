@@ -412,7 +412,7 @@ func TestIndependentKueueProfiles(t *testing.T) {
 		}},
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
-		ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default", UID: "gang", Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}},
 		Spec:       groveschedulerv1alpha1.PodGangSpec{PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: "demo-0-worker", MinReplicas: 1}}},
 	}
 	cl := testutils.NewTestClientBuilder().WithObjects(pcs, pg).Build()
@@ -427,6 +427,7 @@ func TestIndependentKueueProfiles(t *testing.T) {
 			profile := configv1alpha1.SchedulerProfile{Name: tc.name, Config: &runtime.RawExtension{Raw: []byte(`{"underlyingSchedulerName":"` + tc.underlying + `"}`)}}
 			backend := New(cl, cl.Scheme(), record.NewFakeRecorder(10), profile)
 			require.NoError(t, backend.Init(nil))
+			require.NoError(t, backend.SyncPodGang(t.Context(), pg))
 			assert.Equal(t, string(tc.name), backend.Name())
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
 			require.NoError(t, backend.PreparePod(pod, scheduler.PodPreparationContext{

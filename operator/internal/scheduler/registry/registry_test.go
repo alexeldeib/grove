@@ -350,12 +350,15 @@ func TestIndependentKueueProfiles(t *testing.T) {
 	assert.NotSame(t, reg.Get("kueue"), reg.Get("kueue-default"))
 	pcs := &grovecorev1alpha1.PodCliqueSet{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default", Labels: map[string]string{"kueue.x-k8s.io/queue-name": "queue-a"}}}
 	pcs.Spec.Template.Cliques = []*grovecorev1alpha1.PodCliqueTemplateSpec{{Name: "worker", Spec: grovecorev1alpha1.PodCliqueSpec{Replicas: 1}}}
-	pg := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default"}, Spec: groveschedulerv1alpha1.PodGangSpec{PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: "demo-0-worker", MinReplicas: 1}}}}
+	pg := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default", UID: "gang", Labels: map[string]string{"app.kubernetes.io/part-of": "demo"}}, Spec: groveschedulerv1alpha1.PodGangSpec{PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: "demo-0-worker", MinReplicas: 1}}}}
+	require.NoError(t, cl.Create(t.Context(), pcs))
+	require.NoError(t, cl.Create(t.Context(), pg))
 	for name, underlying := range map[string]string{"kueue": "binpack-scheduler", "kueue-default": "default-scheduler"} {
 		t.Run(name, func(t *testing.T) {
 			b := reg.Get(name)
 			require.NotNil(t, b)
 			assert.Equal(t, name, b.Name())
+			require.NoError(t, b.SyncPodGang(t.Context(), pg))
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
 			require.NoError(t, b.PreparePod(pod, scheduler.PodPreparationContext{PodCliqueSet: pcs, PodClique: &grovecorev1alpha1.PodClique{ObjectMeta: metav1.ObjectMeta{Name: "demo-0-worker", Namespace: "default"}}, PodGang: pg, PodGangName: pg.Name}))
 			assert.Equal(t, underlying, pod.Spec.SchedulerName)
