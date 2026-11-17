@@ -254,6 +254,9 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 			return err
 		}
 	}
+	if err := b.syncPreemptibleLabel(ctx, existing, desired); err != nil {
+		return err
+	}
 	return b.updatePrebuiltWorkloadIfNeeded(ctx, podGang, existing, desired)
 }
 
@@ -903,6 +906,9 @@ func (b *schedulerBackend) buildPrebuiltWorkload(ctx context.Context, pcs *grove
 	if err := unstructured.SetNestedSlice(workload.Object, podSets, "spec", "podSets"); err != nil {
 		return nil, err
 	}
+	if err := applyPreemptionProtection(workload, pcs, podGang); err != nil {
+		return nil, err
+	}
 	if err := b.applyWorkloadPriority(ctx, workload, pcs); err != nil {
 		return nil, err
 	}
@@ -1260,6 +1266,9 @@ func (b *schedulerBackend) ValidatePodCliqueSetUpdate(
 		}
 	}
 	if hasKueueEnabledClique {
+		if oldPCS.Annotations[protectedReplicasAnnotation] != newPCS.Annotations[protectedReplicasAnnotation] {
+			return fmt.Errorf("annotation %q is immutable for Kueue-scheduled PodCliqueSets; create a new PodCliqueSet to change protected replicas", protectedReplicasAnnotation)
+		}
 		for _, label := range []string{queueNameLabel, priorityClassNameLabel} {
 			if oldPCS.Labels[label] != newPCS.Labels[label] {
 				return fmt.Errorf("label %q is immutable for Kueue-scheduled PodCliqueSets; create a new PodCliqueSet to change admission", label)
