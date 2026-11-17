@@ -29,9 +29,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -58,6 +60,43 @@ func TestSyncExpectationsAndComputeDifferenceRestoresTerminatingPodsAfterRestart
 
 	assert.Equal(t, -1, diff, "the terminating Pod must be replaced after an operator restart")
 	assert.ElementsMatch(t, []types.UID{"terminating"}, r.expectationsStore.GetDeleteExpectations(sc.pclqExpectationsStoreKey))
+}
+
+func TestDeleteTerminalPodsFreesTheReplicaSlot(t *testing.T) {
+	newPod := func(name string, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(name)},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+	}
+	failed := newPod("failed", corev1.PodFailed)
+	running := newPod("running", corev1.PodRunning)
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, grovecorev1alpha1.AddToScheme(scheme))
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(failed, running).Build()
+
+	r := _resource{client: fakeClient, scheme: scheme, eventRecorder: record.NewFakeRecorder(10), expectationsStore: expect.NewExpectationsStore()}
+	sc := &syncContext{
+		ctx: context.Background(),
+		pclq: &grovecorev1alpha1.PodClique{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-pclq", Namespace: "default"},
+			Spec:       grovecorev1alpha1.PodCliqueSpec{Replicas: 2},
+		},
+		existingPCLQPods:         []*corev1.Pod{failed, running},
+		pclqExpectationsStoreKey: "default/test-pclq",
+	}
+
+	require.NoError(t, r.deleteTerminalPods(sc, logr.Discard()))
+
+	// Only the terminal Pod is deleted; the running one is untouched.
+	assert.True(t, apierrors.IsNotFound(fakeClient.Get(context.Background(), client.ObjectKeyFromObject(failed), &corev1.Pod{})))
+	assert.NoError(t, fakeClient.Get(context.Background(), client.ObjectKeyFromObject(running), &corev1.Pod{}))
+
+	// The delete expectation makes the difference negative so a replacement is created.
+	assert.ElementsMatch(t, []types.UID{"failed"}, r.expectationsStore.GetDeleteExpectations(sc.pclqExpectationsStoreKey))
+	assert.Equal(t, -1, r.syncExpectationsAndComputeDifference(logr.Discard(), sc))
 }
 
 func TestCheckAndRemovePodSchedulingGates_MinAvailableAware(t *testing.T) {
