@@ -19,7 +19,8 @@ package scheduler
 import groveschedulerv1alpha1 "github.com/ai-dynamo/grove/scheduler/api/core/v1alpha1"
 
 // RequiredTopologyKeyForPodGroup returns the required topology key for a PodGroup,
-// preferring its constraint over the PodGang constraint and the supplied fallback.
+// preferring its own constraint, then its topology constraint group, the PodGang constraint,
+// and finally the supplied fallback.
 func RequiredTopologyKeyForPodGroup(podGang *groveschedulerv1alpha1.PodGang, podGroupName, fallback string) string {
 	if podGang == nil {
 		return fallback
@@ -30,6 +31,16 @@ func RequiredTopologyKeyForPodGroup(podGang *groveschedulerv1alpha1.PodGang, pod
 				return key
 			}
 			break
+		}
+	}
+	for _, group := range podGang.Spec.TopologyConstraintGroupConfigs {
+		for _, name := range group.PodGroupNames {
+			if name == podGroupName {
+				if key := requiredTopologyKey(group.TopologyConstraint); key != "" {
+					return key
+				}
+				break
+			}
 		}
 	}
 	if key := requiredTopologyKey(podGang.Spec.TopologyConstraint); key != "" {

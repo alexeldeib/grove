@@ -15,11 +15,18 @@
 package podgang
 
 import (
+	"context"
 	"testing"
 
+	apicommon "github.com/ai-dynamo/grove/operator/api/common"
+	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
+	groveclient "github.com/ai-dynamo/grove/operator/internal/client"
 	testutils "github.com/ai-dynamo/grove/operator/test/utils"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
@@ -130,4 +137,57 @@ func TestPodGangSpecChangePredicate(t *testing.T) {
 			assert.Equal(t, tc.shouldAllowUpdateEvent, pred.Update(event.UpdateEvent{ObjectOld: oldPG, ObjectNew: newPG}), "Update")
 		})
 	}
+}
+
+func TestPodCliqueSetChangePredicate(t *testing.T) {
+	pred := podCliqueSetChangePredicate()
+	managedLabels := map[string]string{apicommon.LabelManagedByKey: apicommon.LabelManagedByValue}
+
+	oldPCS := &grovecorev1alpha1.PodCliqueSet{
+		ObjectMeta: metav1.ObjectMeta{Generation: 1, Labels: managedLabels},
+	}
+	newPCS := oldPCS.DeepCopy()
+	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: oldPCS, ObjectNew: newPCS}))
+
+	newPCS.Generation = 2
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: oldPCS, ObjectNew: newPCS}))
+
+	newPCS = oldPCS.DeepCopy()
+	newPCS.Labels = map[string]string{
+		apicommon.LabelManagedByKey: apicommon.LabelManagedByValue,
+		"kueue.x-k8s.io/queue-name": "queue-b",
+	}
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: oldPCS, ObjectNew: newPCS}))
+}
+
+func TestMapPodCliqueSetToPodGangs(t *testing.T) {
+	const namespace = "default"
+	pcs := &grovecorev1alpha1.PodCliqueSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: namespace},
+	}
+	labelsForPCS := func(name string) map[string]string {
+		return map[string]string{
+			apicommon.LabelManagedByKey: apicommon.LabelManagedByValue,
+			apicommon.LabelPartOfKey:    name,
+			apicommon.LabelComponentKey: apicommon.LabelComponentNamePodGang,
+		}
+	}
+	first := testutils.NewPodGangBuilder("demo-0", namespace).Build()
+	first.Labels = labelsForPCS(pcs.Name)
+	second := testutils.NewPodGangBuilder("demo-0-workers-0", namespace).Build()
+	second.Labels = labelsForPCS(pcs.Name)
+	other := testutils.NewPodGangBuilder("other-0", namespace).Build()
+	other.Labels = labelsForPCS("other")
+
+	r := &Reconciler{Client: fake.NewClientBuilder().
+		WithScheme(groveclient.Scheme).
+		WithObjects(first, second, other).
+		Build()}
+	requests := r.mapPodCliqueSetToPodGangs(context.Background(), pcs)
+
+	require.Len(t, requests, 2)
+	assert.ElementsMatch(t, []string{"demo-0", "demo-0-workers-0"}, []string{
+		requests[0].Name,
+		requests[1].Name,
+	})
 }
