@@ -40,6 +40,9 @@ func RegisterControllers(mgr ctrl.Manager, config *configv1alpha1.OperatorConfig
 	if err := componentutils.RegisterPodControllerUIDIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		return err
 	}
+	if err := componentutils.RegisterPodCliqueNameIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		return err
+	}
 	pcsReconciler := podcliqueset.NewReconciler(mgr, config.Controllers.PodCliqueSet, config.TopologyAwareScheduling, config.Network, schedRegistry)
 	if err := pcsReconciler.RegisterWithManager(mgr); err != nil {
 		return err

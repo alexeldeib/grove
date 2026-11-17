@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	apicommon "github.com/ai-dynamo/grove/operator/api/common"
 	configv1alpha1 "github.com/ai-dynamo/grove/operator/api/config/v1alpha1"
@@ -48,6 +49,7 @@ const (
 	prebuiltWorkloadNameLabel        = "kueue.x-k8s.io/prebuilt-workload-name"
 	podGroupServingAnnotation        = "kueue.x-k8s.io/pod-group-serving"
 	retriableInGroupAnnotation       = "kueue.x-k8s.io/retriable-in-group"
+	podFinalizer                     = "kueue.x-k8s.io/managed"
 	podSetRequiredTopologyAnnotation = "kueue.x-k8s.io/podset-required-topology"
 	kueueAdmissionSchedulingGate     = "kueue.x-k8s.io/admission"
 	isGroupWorkloadAnnotation        = "kueue.x-k8s.io/is-group-workload"
@@ -74,6 +76,12 @@ const (
 )
 
 const podSetUnconstrainedTopologyAnnotation = "kueue.x-k8s.io/podset-unconstrained-topology"
+
+const (
+	podGroupLifecycleAnnotation = "grove.io/kueue-pod-group-lifecycle"
+	podGroupLifecycleServing    = "serving"
+	podGroupLifecycleLegacy     = "legacy"
+)
 
 var workloadGVK = schema.GroupVersionKind{
 	Group:   "kueue.x-k8s.io",
@@ -102,6 +110,7 @@ type schedulerBackend struct {
 }
 
 var _ scheduler.Backend = (*schedulerBackend)(nil)
+var _ scheduler.Finalizer = (*schedulerBackend)(nil)
 var _ scheduler.PodCliqueSetUpdateValidator = (*schedulerBackend)(nil)
 
 // New creates the Kueue scheduler backend.
@@ -196,6 +205,15 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 				}
 			}
 			setAdmissionGates(desired, gates)
+			// Choose once per lease, before any member can be created. Even a
+			// finished legacy lease can leave terminal members in the API.
+			mode, modeErr := b.observedPodGroupLifecycle(ctx, podGang, podGroupLifecycleServing)
+			if modeErr != nil {
+				return modeErr
+			}
+			annotations := desired.GetAnnotations()
+			annotations[podGroupLifecycleAnnotation] = mode
+			desired.SetAnnotations(annotations)
 			if err = b.client.Create(ctx, desired); err != nil {
 				return fmt.Errorf("failed to create prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
 			}
@@ -670,7 +688,11 @@ func (b *schedulerBackend) deleteWorkload(ctx context.Context, workload *unstruc
 	if uid == "" {
 		return b.client.Delete(ctx, workload)
 	}
-	return b.client.Delete(ctx, workload, client.Preconditions{UID: &uid})
+	preconditions := client.Preconditions{UID: &uid}
+	if version := workload.GetResourceVersion(); version != "" {
+		preconditions.ResourceVersion = &version
+	}
+	return b.client.Delete(ctx, workload, preconditions)
 }
 
 func podHasSchedulingGate(pod *corev1.Pod, name string) bool {
@@ -1012,17 +1034,104 @@ func (b *schedulerBackend) PreparePod(pod *corev1.Pod, preparation scheduler.Pod
 	}
 	pod.Annotations[podGroupTotalCountAnnotation] = strconv.Itoa(podGangTotalCount)
 	pod.Annotations[roleHashAnnotation] = preparation.PodClique.Name
-	// Grove-managed pods are deliberately NOT marked as a Kueue "serving" pod group. A serving group is never
-	// considered finished, so Kueue would never remove the kueue.x-k8s.io/managed finalizer on teardown (the
-	// prebuilt Workload has no Kueue finalizer, so Workload deletion cannot trigger finalization either). As a
-	// non-serving unretriable group, Kueue finalizes the Pods once they all terminate, letting them drain.
-	if pod.Annotations[retriableInGroupAnnotation] == "" {
+	// Never mix lifecycle modes during an operator-only upgrade. The Workload
+	// records the choice even after every old member has disappeared.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	mode, err := b.podGroupLifecycle(ctx, preparation.PodGang)
+	if err != nil {
+		return err
+	}
+	if mode == podGroupLifecycleServing {
+		pod.Annotations[podGroupServingAnnotation] = "true"
+		delete(pod.Annotations, retriableInGroupAnnotation)
+	} else {
+		delete(pod.Annotations, podGroupServingAnnotation)
 		pod.Annotations[retriableInGroupAnnotation] = "false"
 	}
 	if topologyKey := scheduler.RequiredTopologyKeyForPodGroup(preparation.PodGang, preparation.PodClique.Name, b.config.RequiredTopologyKey); topologyKey != "" && pod.Annotations[podSetRequiredTopologyAnnotation] == "" {
 		pod.Annotations[podSetRequiredTopologyAnnotation] = topologyKey
 	}
 	return nil
+}
+
+// podGroupLifecycle migrates unmarked leases using an uncached inventory. An
+// empty existing lease stays legacy: absence of cached/live members is not an
+// activation signal. Optimistic locking serializes simultaneous clique upgrades.
+func (b *schedulerBackend) podGroupLifecycle(ctx context.Context, pg *groveschedulerv1alpha1.PodGang) (string, error) {
+	wl := newKueueWorkload(pg.Namespace, pg.Name)
+	if err := b.liveReader().Get(ctx, client.ObjectKeyFromObject(wl), wl); err != nil {
+		return "", fmt.Errorf("cannot choose pod lifecycle before reading Workload %s/%s: %w", pg.Namespace, pg.Name, err)
+	}
+	if !workloadOwnedByPodGang(wl, pg) || wl.GetDeletionTimestamp() != nil {
+		return "", fmt.Errorf("cannot choose pod lifecycle for unowned or deleting Workload %s/%s", pg.Namespace, pg.Name)
+	}
+	mode := wl.GetAnnotations()[podGroupLifecycleAnnotation]
+	if mode == podGroupLifecycleServing || mode == podGroupLifecycleLegacy {
+		return mode, nil
+	}
+	if mode != "" {
+		return "", fmt.Errorf("unknown pod lifecycle %q on Workload %s/%s", mode, pg.Namespace, pg.Name)
+	}
+	mode, err := b.observedPodGroupLifecycle(ctx, pg, podGroupLifecycleLegacy)
+	if err != nil {
+		return "", err
+	}
+	annotations := wl.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	annotations[podGroupLifecycleAnnotation] = mode
+	wl.SetAnnotations(annotations)
+	// Workload RBAC grants update, not patch. Keep the resourceVersion from
+	// the live read so a competing migration or controller update conflicts.
+	if err := b.client.Update(ctx, wl); err != nil {
+		return "", fmt.Errorf("failed to persist pod lifecycle on Workload %s/%s: %w", pg.Namespace, pg.Name, err)
+	}
+	return mode, nil
+}
+
+func (b *schedulerBackend) observedPodGroupLifecycle(ctx context.Context, pg *groveschedulerv1alpha1.PodGang, emptyMode string) (string, error) {
+	pods := &corev1.PodList{}
+	if err := b.liveReader().List(ctx, pods, client.InNamespace(pg.Namespace), client.MatchingLabels{prebuiltWorkloadNameLabel: pg.Name}); err != nil {
+		return "", fmt.Errorf("failed to inventory lifecycle of PodGang %s/%s: %w", pg.Namespace, pg.Name, err)
+	}
+	mode := ""
+	for _, pod := range pods.Items {
+		memberMode := podGroupLifecycleLegacy
+		if pod.Annotations[podGroupServingAnnotation] == "true" {
+			memberMode = podGroupLifecycleServing
+		}
+		if mode != "" && mode != memberMode {
+			return "", fmt.Errorf("PodGang %s/%s has mixed pod lifecycle modes; controlled group recreation is required", pg.Namespace, pg.Name)
+		}
+		mode = memberMode
+	}
+	if mode == "" {
+		mode = emptyMode
+	}
+	return mode, nil
+}
+
+// RemovePodFinalizers releases only Kueue's finalizer; other owners retain theirs.
+func (b *schedulerBackend) RemovePodFinalizers(ctx context.Context, pod *corev1.Pod) error {
+	if !controllerutil.ContainsFinalizer(pod, podFinalizer) {
+		return nil
+	}
+	patched := pod.DeepCopy()
+	controllerutil.RemoveFinalizer(patched, podFinalizer)
+	if err := b.client.Patch(ctx, patched, client.MergeFromWithOptions(pod, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("failed to remove Kueue finalizer from Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	return nil
+}
+
+// IsPodFinalized matches Kueue 0.19.4's serving-group deletion predicate.
+// Bound old processes must terminate before replacements can consume the same slot.
+func (b *schedulerBackend) IsPodFinalized(pod *corev1.Pod) bool {
+	return pod.Labels[prebuiltWorkloadNameLabel] == "" || pod.Status.Phase == corev1.PodFailed ||
+		(pod.DeletionTimestamp != nil && (pod.Spec.NodeName == "" ||
+			(pod.Annotations[podGroupServingAnnotation] == "true" && pod.Status.Phase == corev1.PodSucceeded)))
 }
 
 func podGangTotalPodCount(pcs *grovecorev1alpha1.PodCliqueSet, podGang *groveschedulerv1alpha1.PodGang) (int, error) {
