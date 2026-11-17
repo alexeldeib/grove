@@ -218,6 +218,98 @@ func TestBackendBuildPrebuiltWorkloadUnconstrainedTopology(t *testing.T) {
 	assert.Equal(t, "true", annotation)
 }
 
+func TestBackendExcludesCliqueFromKueueAdmission(t *testing.T) {
+	const (
+		namespace = "default"
+		pcsName   = "demo"
+		podGang   = "demo-0"
+	)
+	pcs := &grovecorev1alpha1.PodCliqueSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pcsName,
+			Namespace: namespace,
+			Labels:    map[string]string{queueNameLabel: "queue-a"},
+		},
+		Spec: grovecorev1alpha1.PodCliqueSetSpec{
+			Template: grovecorev1alpha1.PodCliqueSetTemplateSpec{
+				Cliques: []*grovecorev1alpha1.PodCliqueTemplateSpec{
+					{
+						Name: "frontend",
+						Annotations: map[string]string{
+							kueueAdmissionDisabledAnnotation: "true",
+						},
+						Spec: grovecorev1alpha1.PodCliqueSpec{Replicas: 1},
+					},
+					{Name: "worker", Spec: grovecorev1alpha1.PodCliqueSpec{Replicas: 2}},
+				},
+			},
+		},
+	}
+	pg := &groveschedulerv1alpha1.PodGang{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podGang,
+			Namespace: namespace,
+			UID:       "podgang-uid",
+			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+		},
+		Spec: groveschedulerv1alpha1.PodGangSpec{
+			PodGroups: []groveschedulerv1alpha1.PodGroup{
+				{Name: "demo-0-frontend", MinReplicas: 1},
+				{Name: "demo-0-worker", MinReplicas: 2},
+			},
+		},
+	}
+	cl := testutils.NewTestClientBuilder().WithObjects(pcs, pg).Build()
+	backend := New(
+		cl,
+		cl.Scheme(),
+		record.NewFakeRecorder(10),
+		configv1alpha1.SchedulerProfile{Name: configv1alpha1.SchedulerNameKueue},
+	).(*schedulerBackend)
+	backend.config.UnderlyingSchedulerName = "binpack-scheduler"
+	require.NoError(t, backend.Init(nil))
+	require.NoError(t, backend.SyncPodGang(context.Background(), pg))
+
+	workload := getTestWorkload(t, cl, namespace, podGang)
+	podSets, found, err := unstructured.NestedSlice(workload.Object, "spec", "podSets")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Len(t, podSets, 1)
+	assert.Equal(t, "demo-0-worker", podSets[0].(map[string]any)["name"])
+
+	frontendPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: namespace,
+		Labels:    map[string]string{queueNameLabel: "queue-a", "keep": "value"},
+	}}
+	require.NoError(t, backend.PreparePod(frontendPod, scheduler.PodPreparationContext{
+		PodCliqueSet: pcs,
+		PodClique: &grovecorev1alpha1.PodClique{ObjectMeta: metav1.ObjectMeta{
+			Name:        "demo-0-frontend",
+			Namespace:   namespace,
+			Annotations: map[string]string{kueueAdmissionDisabledAnnotation: "true"},
+		}},
+		PodGang:     pg,
+		PodGangName: podGang,
+	}))
+	assert.Equal(t, "binpack-scheduler", frontendPod.Spec.SchedulerName)
+	assert.NotContains(t, frontendPod.Labels, queueNameLabel)
+	assert.Equal(t, "value", frontendPod.Labels["keep"])
+	assert.Empty(t, frontendPod.Annotations)
+
+	workerPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: namespace}}
+	require.NoError(t, backend.PreparePod(workerPod, scheduler.PodPreparationContext{
+		PodCliqueSet: pcs,
+		PodClique: &grovecorev1alpha1.PodClique{ObjectMeta: metav1.ObjectMeta{
+			Name:      "demo-0-worker",
+			Namespace: namespace,
+		}},
+		PodGang:     pg,
+		PodGangName: podGang,
+	}))
+	assert.Equal(t, "2", workerPod.Annotations[podGroupTotalCountAnnotation])
+	assert.Equal(t, podGang, workerPod.Labels[prebuiltWorkloadNameLabel])
+}
+
 func TestBackendSyncPodGangIgnoresDefaultedEmptyTemplateMetadata(t *testing.T) {
 	const (
 		namespace = "default"
