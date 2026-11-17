@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
@@ -158,6 +159,23 @@ func TestPodCliqueSetChangePredicate(t *testing.T) {
 		"kueue.x-k8s.io/queue-name": "queue-b",
 	}
 	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: oldPCS, ObjectNew: newPCS}))
+}
+
+func TestKueueWorkloadEvictionPredicate(t *testing.T) {
+	pred := kueueWorkloadEvictionPredicate()
+	running := newKueueWorkloadType()
+	finished := newKueueWorkloadType()
+	require.NoError(t, unstructured.SetNestedSlice(finished.Object, []any{map[string]any{
+		"type":   "Finished",
+		"status": "True",
+	}}, "status", "conditions"))
+
+	assert.False(t, pred.Create(event.CreateEvent{Object: running}), "Create")
+	assert.True(t, pred.Delete(event.DeleteEvent{Object: running}), "Delete")
+	assert.False(t, pred.Generic(event.GenericEvent{Object: running}), "Generic")
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: running, ObjectNew: finished}), "Update finished transition")
+	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: finished, ObjectNew: finished}), "Update already finished")
+	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: running, ObjectNew: running}), "Update running")
 }
 
 func TestMapPodCliqueSetToPodGangs(t *testing.T) {
