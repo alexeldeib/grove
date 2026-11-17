@@ -149,18 +149,16 @@ func podGangSpecChangePredicate() predicate.Predicate {
 	}
 }
 
-// podCliqueSetChangePredicate enqueues PodGangs when their parent PodCliqueSet
-// changes spec or labels. Scheduler backends may derive their external resource
-// from both objects; Kueue, for example, takes queue selection from a PCS label.
+// Parent PCSs are user/provider-owned; their managed PodGangs must see spec, label, and floor changes.
 func podCliqueSetChangePredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(_ event.CreateEvent) bool { return false },
 		DeleteFunc: func(_ event.DeleteEvent) bool { return false },
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return grovectrlutils.IsManagedByGrove(e.ObjectOld.GetLabels()) &&
-				grovectrlutils.IsManagedByGrove(e.ObjectNew.GetLabels()) &&
-				(e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
-					!maps.Equal(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels()))
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				!maps.Equal(e.ObjectOld.GetLabels(), e.ObjectNew.GetLabels()) ||
+				e.ObjectOld.GetAnnotations()["grove.io/kueue-protected-replicas"] !=
+					e.ObjectNew.GetAnnotations()["grove.io/kueue-protected-replicas"]
 		},
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}

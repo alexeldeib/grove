@@ -1166,6 +1166,9 @@ func kueueAdmissionDisabled(annotations map[string]string) bool {
 // (minAvailable < replicas) semantics. PodCliques that belong to a PodCliqueScalingGroup are
 // all-or-nothing and never set minCount, so they are excluded from this check.
 func (b *schedulerBackend) ValidatePodCliqueSet(_ context.Context, pcs *grovecorev1alpha1.PodCliqueSet) error {
+	if _, err := protectedReplicaCounts(pcs); err != nil {
+		return err
+	}
 	var (
 		partialGangCliques     []string
 		partialGangPCSGCliques []string
@@ -1222,6 +1225,9 @@ func (b *schedulerBackend) ValidatePodCliqueSetUpdate(
 	_ context.Context,
 	oldPCS, newPCS *grovecorev1alpha1.PodCliqueSet,
 ) error {
+	if _, err := protectedReplicaCounts(newPCS); err != nil {
+		return err
+	}
 	oldCliques := make(map[string]*grovecorev1alpha1.PodCliqueTemplateSpec, len(oldPCS.Spec.Template.Cliques))
 	for _, clique := range oldPCS.Spec.Template.Cliques {
 		if clique != nil {
@@ -1266,9 +1272,6 @@ func (b *schedulerBackend) ValidatePodCliqueSetUpdate(
 		}
 	}
 	if hasKueueEnabledClique {
-		if oldPCS.Annotations[protectedReplicasAnnotation] != newPCS.Annotations[protectedReplicasAnnotation] {
-			return fmt.Errorf("annotation %q is immutable for Kueue-scheduled PodCliqueSets; create a new PodCliqueSet to change protected replicas", protectedReplicasAnnotation)
-		}
 		for _, label := range []string{queueNameLabel, priorityClassNameLabel} {
 			if oldPCS.Labels[label] != newPCS.Labels[label] {
 				return fmt.Errorf("label %q is immutable for Kueue-scheduled PodCliqueSets; create a new PodCliqueSet to change admission", label)
