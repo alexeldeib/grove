@@ -19,11 +19,14 @@ import (
 	"maps"
 
 	apicommon "github.com/ai-dynamo/grove/operator/api/common"
+	configv1alpha1 "github.com/ai-dynamo/grove/operator/api/config/v1alpha1"
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	componentutils "github.com/ai-dynamo/grove/operator/internal/controller/common/component/utils"
 	grovectrlutils "github.com/ai-dynamo/grove/operator/internal/controller/utils"
 
 	groveschedulerv1alpha1 "github.com/ai-dynamo/grove/scheduler/api/core/v1alpha1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,18 +39,76 @@ import (
 
 // RegisterWithManager registers the backend controller with the manager
 func (r *Reconciler) RegisterWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	ctrlBuilder := ctrl.NewControllerManagedBy(mgr).
 		For(&groveschedulerv1alpha1.PodGang{}, builder.WithPredicates(podGangSpecChangePredicate())).
 		Watches(
 			&grovecorev1alpha1.PodCliqueSet{},
 			handler.EnqueueRequestsFromMapFunc(r.mapPodCliqueSetToPodGangs),
 			builder.WithPredicates(podCliqueSetChangePredicate()),
-		).
+		)
+
+	// The Kueue backend recreates its prebuilt Workload out of band: Kueue finalizes it
+	// (Finished/OutOfSync) when the owning PodGang changes shape and makes it immutable after quota
+	// reservation, so SyncPodGang evicts and later recreates it. Neither the eviction nor the recreation
+	// changes the PodGang generation, so watch the Workload and re-enqueue its owner to drive that cycle.
+	// Gated on the Kueue backend being registered so deployments without Kueue do not require its CRD to
+	// start the informer.
+	if r.schedRegistry.Get(string(configv1alpha1.SchedulerNameKueue)) != nil {
+		ctrlBuilder = ctrlBuilder.Watches(
+			newKueueWorkloadType(),
+			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &groveschedulerv1alpha1.PodGang{}),
+			builder.WithPredicates(kueueWorkloadEvictionPredicate()),
+		)
+	}
+
+	return ctrlBuilder.
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: *r.config.ConcurrentSyncs,
 		}).
 		Named("podgang").
 		Complete(r)
+}
+
+// newKueueWorkloadType returns an empty Kueue Workload typed for informer registration.
+func newKueueWorkloadType() *unstructured.Unstructured {
+	workload := &unstructured.Unstructured{}
+	workload.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta2",
+		Kind:    "Workload",
+	})
+	return workload
+}
+
+// kueueWorkloadEvictionPredicate enqueues the owning PodGang when its prebuilt Workload is deleted (so
+// SyncPodGang recreates it) or when Kueue finalizes it (so SyncPodGang evicts it). Grove writes only the
+// Workload spec and metadata, never its status, so reacting to the Finished transition cannot feed back
+// into a reconcile loop.
+func kueueWorkloadEvictionPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(_ event.CreateEvent) bool { return false },
+		DeleteFunc: func(_ event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return kueueWorkloadFinished(e.ObjectNew) && !kueueWorkloadFinished(e.ObjectOld)
+		},
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+}
+
+// kueueWorkloadFinished reports whether the Workload carries a Finished=True status condition.
+func kueueWorkloadFinished(obj client.Object) bool {
+	workload, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return false
+	}
+	conditions, _, _ := unstructured.NestedSlice(workload.Object, "status", "conditions")
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]any)
+		if ok && condition["type"] == "Finished" && condition["status"] == "True" {
+			return true
+		}
+	}
+	return false
 }
 
 // podGangSpecChangePredicate filters PodGang events to only process spec changes
