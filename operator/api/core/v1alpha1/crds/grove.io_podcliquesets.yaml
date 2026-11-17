@@ -9561,6 +9561,27 @@ spec:
                             - scope
                             type: object
                           type: array
+                        rollingUpdate:
+                          description: RollingUpdate is the per-component update configuration
+                            for this PodCliqueScalingGroup.
+                          properties:
+                            maxUnavailable:
+                              description: |-
+                                MaxUnavailable bounds the disruption Grove causes while updating this
+                                PodCliqueScalingGroup. Grove stops taking down ready replicas once this many replicas are
+                                unavailable, and recreates at most this many already-unavailable replicas per reconcile.
+                                A replica counts as unavailable while any of its PodCliques is missing, terminating or not
+                                ready, including one already recreated at the new PodTemplateHash whose Pods have not
+                                become available yet.
+                                Recovery is never blocked: replacing an already-unavailable replica does not change how
+                                many replicas are unavailable, so it stays permitted even at the cap. What the cap
+                                prevents is an update taking down healthy replicas faster than replacements become
+                                available.
+                                When unset, Grove keeps its existing unbounded behaviour.
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          type: object
                         scaleConfig:
                           description: ScaleConfig is the horizontal pod autoscaler
                             configuration for the pod clique scaling group.
