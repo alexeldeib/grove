@@ -169,12 +169,16 @@ func TestKueueWorkloadEvictionPredicate(t *testing.T) {
 		"type":   "Finished",
 		"status": "True",
 	}}, "status", "conditions"))
+	deactivated := newKueueWorkloadType()
+	require.NoError(t, unstructured.SetNestedField(deactivated.Object, false, "spec", "active"))
 
 	assert.False(t, pred.Create(event.CreateEvent{Object: running}), "Create")
 	assert.True(t, pred.Delete(event.DeleteEvent{Object: running}), "Delete")
 	assert.False(t, pred.Generic(event.GenericEvent{Object: running}), "Generic")
 	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: running, ObjectNew: finished}), "Update finished transition")
 	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: finished, ObjectNew: finished}), "Update already finished")
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: running, ObjectNew: deactivated}), "Update deactivated transition")
+	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: deactivated, ObjectNew: deactivated}), "Update already deactivated")
 	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: running, ObjectNew: running}), "Update running")
 }
 

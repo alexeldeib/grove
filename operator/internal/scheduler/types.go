@@ -52,6 +52,15 @@ type Backend interface {
 	ValidatePodCliqueSet(ctx context.Context, pcs *grovecorev1alpha1.PodCliqueSet) error
 }
 
+// PodCliqueSetUpdateValidator is an optional interface for scheduler backends that impose additional
+// invariants across PodCliqueSet updates. The admission webhook invokes it with both object versions.
+type PodCliqueSetUpdateValidator interface {
+	ValidatePodCliqueSetUpdate(
+		ctx context.Context,
+		oldPCS, newPCS *grovecorev1alpha1.PodCliqueSet,
+	) error
+}
+
 // PodPreparationContext contains the Grove resources associated with a Pod being prepared.
 type PodPreparationContext struct {
 	PodCliqueSet *grovecorev1alpha1.PodCliqueSet
