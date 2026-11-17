@@ -41,7 +41,9 @@ import (
 )
 
 const (
-	maxCombinedResourceNameLength = 45
+	// Leave headroom for compact PCSG/PCLQ names (e.g. "w"/"l") while still
+	// allowing a 45-char PodCliqueSet name such as "<prefix>-<uuid>-m".
+	maxCombinedResourceNameLength = 47
 )
 
 var allowedStartupTypes = sets.New(grovecorev1alpha1.CliqueStartupTypeInOrder, grovecorev1alpha1.CliqueStartupTypeAnyOrder, grovecorev1alpha1.CliqueStartupTypeExplicit)
@@ -1021,7 +1023,7 @@ func (v *pcsValidator) validatePodCliqueUpdate(oldCliques []*grovecorev1alpha1.P
 //
 // Constraints:
 // - Random string + hyphens: 10 chars for PCSG pods, 8 chars for non-PCSG pods
-// - Max sum of all resource name characters: 45 chars
+// - Max sum of all resource name characters: maxCombinedResourceNameLength chars
 func validatePodNameConstraints(pcsName, pcsgName, pclqName string) error {
 	// Check resource name constraints
 	resourceNameLength := len(pcsName) + len(pclqName)
@@ -1031,11 +1033,11 @@ func validatePodNameConstraints(pcsName, pcsgName, pclqName string) error {
 
 	if resourceNameLength > maxCombinedResourceNameLength {
 		if pcsgName != "" {
-			return fmt.Errorf("combined resource name length %d exceeds 45-character limit required for pod naming. Consider shortening: PodCliqueSet '%s', PodCliqueScalingGroup '%s', or PodClique '%s'",
-				resourceNameLength, pcsName, pcsgName, pclqName)
+			return fmt.Errorf("combined resource name length %d exceeds %d-character limit required for pod naming. Consider shortening: PodCliqueSet '%s', PodCliqueScalingGroup '%s', or PodClique '%s'",
+				resourceNameLength, maxCombinedResourceNameLength, pcsName, pcsgName, pclqName)
 		}
-		return fmt.Errorf("combined resource name length %d exceeds 45-character limit required for pod naming. Consider shortening: PodCliqueSet '%s' or PodClique '%s'",
-			resourceNameLength, pcsName, pclqName)
+		return fmt.Errorf("combined resource name length %d exceeds %d-character limit required for pod naming. Consider shortening: PodCliqueSet '%s' or PodClique '%s'",
+			resourceNameLength, maxCombinedResourceNameLength, pcsName, pclqName)
 	}
 	return nil
 }
