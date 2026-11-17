@@ -17,6 +17,7 @@ package podgang
 import (
 	"context"
 	"maps"
+	"strings"
 
 	apicommon "github.com/ai-dynamo/grove/operator/api/common"
 	configv1alpha1 "github.com/ai-dynamo/grove/operator/api/config/v1alpha1"
@@ -45,6 +46,14 @@ func (r *Reconciler) RegisterWithManager(mgr ctrl.Manager) error {
 			&grovecorev1alpha1.PodCliqueSet{},
 			handler.EnqueueRequestsFromMapFunc(r.mapPodCliqueSetToPodGangs),
 			builder.WithPredicates(podCliqueSetChangePredicate()),
+		).
+		// A base PodGang becoming scheduled is what releases its scaled siblings' admission gate, but
+		// that transition is a PodClique status write that bumps no PodGang generation, so
+		// podGangSpecChangePredicate never sees it.
+		Watches(
+			&grovecorev1alpha1.PodClique{},
+			handler.EnqueueRequestsFromMapFunc(r.mapBasePodCliqueToPodGangs),
+			builder.WithPredicates(podCliqueScheduledReplicasChangePredicate()),
 		)
 
 	// The Kueue backend recreates its prebuilt Workload out of band: Kueue finalizes it
@@ -158,6 +167,66 @@ func podCliqueSetChangePredicate() predicate.Predicate {
 
 // mapPodCliqueSetToPodGangs maps a parent PCS change to all of its concrete
 // PodGangs so each scheduler backend can reconcile its derived resource.
+// podCliqueScheduledReplicasChangePredicate enqueues on a change to PodClique.status.scheduledReplicas,
+// the only signal that a base PodGang became scheduled. A PodClique is created with none scheduled and
+// a base losing scheduling releases nothing, so creates and deletes are ignored.
+func podCliqueScheduledReplicasChangePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(_ event.CreateEvent) bool { return false },
+		DeleteFunc: func(_ event.DeleteEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPclq, okOld := e.ObjectOld.(*grovecorev1alpha1.PodClique)
+			newPclq, okNew := e.ObjectNew.(*grovecorev1alpha1.PodClique)
+			if !okOld || !okNew {
+				return false
+			}
+			return grovectrlutils.IsManagedByGrove(newPclq.GetLabels()) &&
+				oldPclq.Status.ScheduledReplicas != newPclq.Status.ScheduledReplicas
+		},
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+}
+
+// mapBasePodCliqueToPodGangs enqueues the base PodGang and its own replica's scaled siblings when a
+// base PodClique's scheduled count moves, so each gated sibling can also release itself. Siblings are
+// named <base>-<scalingGroup>-<n>, so the prefix stays within one replica. Scaled PodCliques are
+// skipped since their scheduling gates nobody. A base PodClique without its PodGang label maps to
+// the whole set rather than dropping the event.
+func (r *Reconciler) mapBasePodCliqueToPodGangs(ctx context.Context, obj client.Object) []ctrl.Request {
+	pclq, ok := obj.(*grovecorev1alpha1.PodClique)
+	if !ok {
+		return nil
+	}
+	if _, isScaled := pclq.GetLabels()[apicommon.LabelBasePodGang]; isScaled {
+		return nil
+	}
+	pcsName := pclq.GetLabels()[apicommon.LabelPartOfKey]
+	if pcsName == "" {
+		return nil
+	}
+	podGangs := &groveschedulerv1alpha1.PodGangList{}
+	if err := r.Client.List(
+		ctx,
+		podGangs,
+		client.InNamespace(pclq.Namespace),
+		client.MatchingLabels{apicommon.LabelPartOfKey: pcsName},
+	); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list PodGangs for PodClique watch mapping",
+			"podClique", client.ObjectKeyFromObject(pclq))
+		return nil
+	}
+	base := pclq.GetLabels()[apicommon.LabelPodGang]
+	requests := make([]ctrl.Request, 0, len(podGangs.Items))
+	for i := range podGangs.Items {
+		name := podGangs.Items[i].Name
+		if base != "" && name != base && !strings.HasPrefix(name, base+"-") {
+			continue
+		}
+		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&podGangs.Items[i])})
+	}
+	return requests
+}
+
 func (r *Reconciler) mapPodCliqueSetToPodGangs(ctx context.Context, obj client.Object) []ctrl.Request {
 	pcs, ok := obj.(*grovecorev1alpha1.PodCliqueSet)
 	if !ok {
