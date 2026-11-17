@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -62,6 +63,9 @@ const (
 	// for the Workload. Kueue's webhook accepts gates only when the Workload is created; after that
 	// they can only be removed.
 	admissionGatedByAnnotation = "kueue.x-k8s.io/admission-gated-by"
+	// basePodGangAdmissionGate is the gate Grove holds on a scaled PodGang's Workload until the base
+	// PodGang of its PodCliqueSet replica is scheduled.
+	basePodGangAdmissionGate = "grove.io/base-podgang"
 )
 
 const (
@@ -102,7 +106,7 @@ var _ scheduler.PodCliqueSetUpdateValidator = (*schedulerBackend)(nil)
 
 // New creates the Kueue scheduler backend.
 func New(cl client.Client, scheme *runtime.Scheme, eventRecorder record.EventRecorder, profile configv1alpha1.SchedulerProfile) scheduler.Backend {
-	return &schedulerBackend{
+	b := &schedulerBackend{
 		client:        cl,
 		scheme:        scheme,
 		name:          string(profile.Name),
@@ -110,6 +114,8 @@ func New(cl client.Client, scheme *runtime.Scheme, eventRecorder record.EventRec
 		profile:       profile,
 		config:        defaultConfig(),
 	}
+	b.admissionGatesForCreate = b.baseOrderingAdmissionGates
+	return b
 }
 
 func (b *schedulerBackend) Name() string {
@@ -153,6 +159,12 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 	if desired == nil {
 		return nil
 	}
+	basePodGangName := basePodGangNameFor(podGang)
+	if basePodGangName == "" {
+		if err = b.releaseGatedScaledPodGangs(ctx, podGang); err != nil {
+			return err
+		}
+	}
 	existing := newKueueWorkload(podGang.Namespace, podGang.Name)
 	if err = b.client.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -192,6 +204,11 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 			}
 			log.FromContext(ctx).Info("Created prebuilt Kueue Workload",
 				"workload", client.ObjectKeyFromObject(desired), "admissionGates", gates)
+			if slices.Contains(gates, basePodGangAdmissionGate) {
+				// The base may have become scheduled between the decision and the create, and its
+				// release can miss a Workload it cannot see yet. Re-check live so one side always wins.
+				return b.releaseIfBaseScheduled(ctx, desired, podGang.Namespace, basePodGangName, b.liveReader())
+			}
 			return nil
 		}
 		return fmt.Errorf("failed to get prebuilt kueue Workload %s/%s: %w", podGang.Namespace, podGang.Name, err)
@@ -203,6 +220,11 @@ func (b *schedulerBackend) SyncPodGang(ctx context.Context, podGang *groveschedu
 	}
 	if !workloadOwnedByPodGang(existing, podGang) {
 		return fmt.Errorf("refusing to manage prebuilt kueue Workload %s/%s because it is not owned by PodGang UID %q", existing.GetNamespace(), existing.GetName(), podGang.UID)
+	}
+	if basePodGangName != "" {
+		if err = b.releaseIfBaseScheduled(ctx, existing, podGang.Namespace, basePodGangName, b.client); err != nil {
+			return err
+		}
 	}
 	if !workloadActive(existing) {
 		if err = b.setPodGangWorkloadState(ctx, podGang, kueueWorkloadStateDeactivated); err != nil {
@@ -327,6 +349,171 @@ func (b *schedulerBackend) releaseAdmissionGate(ctx context.Context, workload *u
 		return false, fmt.Errorf("failed to release admission gate %q on prebuilt kueue Workload %s/%s: %w", gate, workload.GetNamespace(), workload.GetName(), err)
 	}
 	return true, nil
+}
+
+// liveReader returns the client that bypasses the informer cache when one is configured.
+func (b *schedulerBackend) liveReader() client.Reader {
+	if b.directClient != nil {
+		return b.directClient
+	}
+	return b.client
+}
+
+// pcsReplicaIndexOf recovers the PodCliqueSet replica a PodGang belongs to. Grove names a base
+// PodGang <pcs>-<replicaIndex> and its scaled siblings <pcs>-<replicaIndex>-<scalingGroup>-<n>, so
+// the index is the first segment after the PodCliqueSet name. The replica-index label is preferred
+// where present.
+func pcsReplicaIndexOf(podGang *groveschedulerv1alpha1.PodGang, pcsName string) (string, bool) {
+	if index, found := podGang.Labels[apicommon.LabelPodCliqueSetReplicaIndex]; found && index != "" {
+		return index, true
+	}
+	suffix, found := strings.CutPrefix(podGang.Name, pcsName+"-")
+	if !found {
+		return "", false
+	}
+	index, _, _ := strings.Cut(suffix, "-")
+	if index == "" {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(index, 10, 32); err != nil {
+		return "", false
+	}
+	return index, true
+}
+
+// basePodGangNameFor returns the base PodGang this one waits for, or "" if it is itself a base. It is
+// derived from names rather than read from apicommon.LabelBasePodGang on a PodClique, because
+// PodCliques are created concurrently with PodGangs and a scaled PodGang synced before its PodClique
+// exists would otherwise read as a base.
+func basePodGangNameFor(podGang *groveschedulerv1alpha1.PodGang) string {
+	pcsName := podGang.Labels[apicommon.LabelPartOfKey]
+	if pcsName == "" {
+		return ""
+	}
+	replicaIndex, ok := pcsReplicaIndexOf(podGang, pcsName)
+	if !ok {
+		return ""
+	}
+	basePodGangName := fmt.Sprintf("%s-%s", pcsName, replicaIndex)
+	if podGang.Name == basePodGangName {
+		return ""
+	}
+	return basePodGangName
+}
+
+// isBasePodGangScheduled mirrors the predicate that lifts grove.io/podgang-pending-creation from a
+// scaled PodGang's Pods: every PodGroup of the base must have at least MinReplicas scheduled. A base
+// or PodClique that does not exist yet counts as unscheduled.
+func isBasePodGangScheduled(ctx context.Context, reader client.Reader, namespace, basePodGangName string) (bool, error) {
+	basePodGang := &groveschedulerv1alpha1.PodGang{}
+	baseKey := client.ObjectKey{Namespace: namespace, Name: basePodGangName}
+	if err := reader.Get(ctx, baseKey, basePodGang); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get base PodGang %v: %w", baseKey, err)
+	}
+	for _, podGroup := range basePodGang.Spec.PodGroups {
+		pclq := &grovecorev1alpha1.PodClique{}
+		pclqKey := client.ObjectKey{Namespace: namespace, Name: podGroup.Name}
+		if err := reader.Get(ctx, pclqKey, pclq); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to get PodClique %v for base PodGang readiness: %w", pclqKey, err)
+		}
+		if pclq.Status.ScheduledReplicas < podGroup.MinReplicas {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// baseOrderingAdmissionGates gates a scaled PodGang's new Workload on its base being scheduled.
+// Kueue admits equal-priority Workloads in creation order and Grove creates a base and its scaled
+// siblings within the same second, so without the gate a sibling can take the quota its base needs
+// while Grove refuses to schedule the sibling until the base is up. Bases and siblings whose base is
+// already scheduled are not gated. A Workload is only created once no Pod holds a prior admission, so
+// gating it cannot strand running Pods.
+func (b *schedulerBackend) baseOrderingAdmissionGates(ctx context.Context, podGang *groveschedulerv1alpha1.PodGang) ([]string, error) {
+	basePodGangName := basePodGangNameFor(podGang)
+	if basePodGangName == "" {
+		return nil, nil
+	}
+	baseScheduled, err := isBasePodGangScheduled(ctx, b.client, podGang.Namespace, basePodGangName)
+	if err != nil || baseScheduled {
+		return nil, err
+	}
+	return []string{basePodGangAdmissionGate}, nil
+}
+
+// releaseIfBaseScheduled removes the base-PodGang gate from a scaled PodGang's Workload once its base
+// is scheduled. reader decides how fresh the base read must be.
+func (b *schedulerBackend) releaseIfBaseScheduled(
+	ctx context.Context,
+	workload *unstructured.Unstructured,
+	namespace, basePodGangName string,
+	reader client.Reader,
+) error {
+	if !slices.Contains(workloadAdmissionGates(workload), basePodGangAdmissionGate) {
+		return nil
+	}
+	baseScheduled, err := isBasePodGangScheduled(ctx, reader, namespace, basePodGangName)
+	if err != nil || !baseScheduled {
+		return err
+	}
+	released, err := b.releaseAdmissionGate(ctx, workload, basePodGangAdmissionGate)
+	if released {
+		log.FromContext(ctx).Info("Released prebuilt Kueue Workload after its base PodGang was scheduled",
+			"workload", client.ObjectKeyFromObject(workload), "basePodGang", basePodGangName)
+	}
+	return err
+}
+
+// releaseGatedScaledPodGangs lifts the base-PodGang gate from every scaled sibling in this base's
+// PodCliqueSet replica once the base is scheduled. A gated sibling produces no events of its own, so
+// the base has to push the release. Gates are only ever removed, so a cached Workload without the
+// gate is authoritative; only a Workload missing from the cache is confirmed live, in case it was
+// created after the cache last synced.
+func (b *schedulerBackend) releaseGatedScaledPodGangs(ctx context.Context, basePodGang *groveschedulerv1alpha1.PodGang) error {
+	baseScheduled, err := isBasePodGangScheduled(ctx, b.client, basePodGang.Namespace, basePodGang.Name)
+	if err != nil || !baseScheduled {
+		return err
+	}
+	pcsName := basePodGang.Labels[apicommon.LabelPartOfKey]
+	baseReplicaIndex, ok := pcsReplicaIndexOf(basePodGang, pcsName)
+	if pcsName == "" || !ok {
+		return nil
+	}
+	podGangs := &groveschedulerv1alpha1.PodGangList{}
+	if err = b.client.List(ctx, podGangs, client.InNamespace(basePodGang.Namespace),
+		client.MatchingLabels{apicommon.LabelPartOfKey: pcsName}); err != nil {
+		return fmt.Errorf("failed to list PodGangs of PodCliqueSet %s/%s: %w", basePodGang.Namespace, pcsName, err)
+	}
+	for i := range podGangs.Items {
+		scaled := &podGangs.Items[i]
+		if scaled.Name == basePodGang.Name {
+			continue
+		}
+		if index, ok := pcsReplicaIndexOf(scaled, pcsName); !ok || index != baseReplicaIndex {
+			continue
+		}
+		workload := newKueueWorkload(scaled.Namespace, scaled.Name)
+		key := client.ObjectKeyFromObject(workload)
+		if err = b.client.Get(ctx, key, workload); apierrors.IsNotFound(err) {
+			err = b.liveReader().Get(ctx, key, workload)
+		}
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to get prebuilt kueue Workload %v while releasing it: %w", key, err)
+		}
+		if err = b.releaseIfBaseScheduled(ctx, workload, basePodGang.Namespace, basePodGang.Name, b.client); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newKueueWorkload(namespace, name string) *unstructured.Unstructured {

@@ -22,6 +22,7 @@ import (
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	groveclient "github.com/ai-dynamo/grove/operator/internal/client"
 	testutils "github.com/ai-dynamo/grove/operator/test/utils"
+	groveschedulerv1alpha1 "github.com/ai-dynamo/grove/scheduler/api/core/v1alpha1"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -212,4 +213,106 @@ func TestMapPodCliqueSetToPodGangs(t *testing.T) {
 		requests[0].Name,
 		requests[1].Name,
 	})
+}
+
+// pclqWithScheduled builds a Grove-managed PodClique for the watch tests.
+func pclqWithScheduled(name, podGangName, basePodGangName string, scheduled int32) *grovecorev1alpha1.PodClique {
+	labels := map[string]string{
+		apicommon.LabelManagedByKey: apicommon.LabelManagedByValue,
+		apicommon.LabelPodGang:      podGangName,
+	}
+	if basePodGangName != "" {
+		labels[apicommon.LabelBasePodGang] = basePodGangName
+	}
+	return &grovecorev1alpha1.PodClique{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+		Status:     grovecorev1alpha1.PodCliqueStatus{ScheduledReplicas: scheduled},
+	}
+}
+
+// A base PodGang becoming scheduled shows up only as a PodClique status write, which bumps no
+// generation. Without this predicate the base is never reconciled on that transition and a gated
+// scaled sibling is never released.
+func TestPodCliqueScheduledReplicasChangePredicate(t *testing.T) {
+	p := podCliqueScheduledReplicasChangePredicate()
+
+	assert.True(t, p.Update(event.UpdateEvent{
+		ObjectOld: pclqWithScheduled("demo-0-worker", "demo-0", "", 0),
+		ObjectNew: pclqWithScheduled("demo-0-worker", "demo-0", "", 1),
+	}), "a change in scheduledReplicas must enqueue")
+
+	assert.False(t, p.Update(event.UpdateEvent{
+		ObjectOld: pclqWithScheduled("demo-0-worker", "demo-0", "", 1),
+		ObjectNew: pclqWithScheduled("demo-0-worker", "demo-0", "", 1),
+	}), "an unrelated status write must not enqueue")
+
+	// The API server drops status on create, so a new PodClique has nothing scheduled, and a base
+	// losing scheduling releases nothing.
+	assert.False(t, p.Create(event.CreateEvent{Object: pclqWithScheduled("demo-0-worker", "demo-0", "", 0)}))
+	assert.False(t, p.Delete(event.DeleteEvent{Object: pclqWithScheduled("demo-0-worker", "demo-0", "", 1)}))
+
+	unmanagedOld := pclqWithScheduled("demo-0-worker", "demo-0", "", 0)
+	unmanagedOld.Labels = map[string]string{}
+	unmanagedNew := unmanagedOld.DeepCopy()
+	unmanagedNew.Status.ScheduledReplicas = 1
+	assert.False(t, p.Update(event.UpdateEvent{ObjectOld: unmanagedOld, ObjectNew: unmanagedNew}),
+		"unmanaged PodCliques stay filtered")
+}
+
+// Only base PodCliques are mapped, and only to their own replica: the base and its scaled siblings.
+func TestMapBasePodCliqueToPodGangs(t *testing.T) {
+	base := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{
+		Name: "demo-0", Namespace: "default",
+		Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}}}
+	tail := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{
+		Name: "demo-0-w-0", Namespace: "default",
+		Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}}}
+	other := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{
+		Name: "unrelated-0", Namespace: "default",
+		Labels: map[string]string{apicommon.LabelPartOfKey: "unrelated"}}}
+	replica1 := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{
+		Name: "demo-1", Namespace: "default",
+		Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}}}
+	replica1Tail := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{
+		Name: "demo-1-w-0", Namespace: "default",
+		Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}}}
+	replica10 := &groveschedulerv1alpha1.PodGang{ObjectMeta: metav1.ObjectMeta{
+		Name: "demo-10", Namespace: "default",
+		Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}}}
+	cl := testutils.NewTestClientBuilder().WithObjects(base, tail, other, replica1, replica1Tail, replica10).Build()
+	r := &Reconciler{Client: cl}
+
+	basePclq := pclqWithScheduled("demo-0-worker", "demo-0", "", 1)
+	basePclq.Labels[apicommon.LabelPartOfKey] = "demo"
+	got := r.mapBasePodCliqueToPodGangs(context.Background(), basePclq)
+	names := make([]string, 0, len(got))
+	for _, req := range got {
+		names = append(names, req.Name)
+	}
+	assert.ElementsMatch(t, []string{"demo-0", "demo-0-w-0"}, names,
+		"the base and its own siblings only: no other replica, no other PodCliqueSet")
+
+	replica1Pclq := pclqWithScheduled("demo-1-worker", "demo-1", "", 1)
+	replica1Pclq.Labels[apicommon.LabelPartOfKey] = "demo"
+	names = names[:0]
+	for _, req := range r.mapBasePodCliqueToPodGangs(context.Background(), replica1Pclq) {
+		names = append(names, req.Name)
+	}
+	assert.ElementsMatch(t, []string{"demo-1", "demo-1-w-0"}, names, "demo-1- must not match demo-10")
+
+	unlabelled := pclqWithScheduled("demo-0-worker", "", "", 1)
+	delete(unlabelled.Labels, apicommon.LabelPodGang)
+	unlabelled.Labels[apicommon.LabelPartOfKey] = "demo"
+	assert.Len(t, r.mapBasePodCliqueToPodGangs(context.Background(), unlabelled), 5,
+		"without its PodGang label the whole set is enqueued rather than dropping the event")
+
+	scaledPclq := pclqWithScheduled("demo-0-w-1-worker", "demo-0-w-0", "demo-0", 1)
+	scaledPclq.Labels[apicommon.LabelPartOfKey] = "demo"
+	assert.Empty(t, r.mapBasePodCliqueToPodGangs(context.Background(), scaledPclq),
+		"a scaled PodClique must not be mapped")
+
+	noPartOf := pclqWithScheduled("demo-0-worker", "demo-0", "", 1)
+	delete(noPartOf.Labels, apicommon.LabelPartOfKey)
+	assert.Empty(t, r.mapBasePodCliqueToPodGangs(context.Background(), noPartOf),
+		"a PodClique with no part-of label must not be mapped")
 }
