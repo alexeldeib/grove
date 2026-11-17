@@ -17,16 +17,24 @@ limitations under the License.
 package pod
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/ai-dynamo/grove/operator/api/common"
+	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
+	"github.com/ai-dynamo/grove/operator/internal/constants"
 	"github.com/ai-dynamo/grove/operator/internal/expect"
+	testutils "github.com/ai-dynamo/grove/operator/test/utils"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 )
 
@@ -52,6 +60,8 @@ func TestComputeUpdateWork(t *testing.T) {
 		{"old terminating is skipped", newTestPod("old-terminating", testOldHash, withDeletionTimestamp()), bucketSkipped},
 		{"new ready", newTestPod("new-ready", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true)), bucketNewReady},
 		{"new not-ready is not tracked", newTestPod("new-not-ready", testNewHash, withPhase(corev1.PodRunning), withContainerStatus(ptr.To(false), false)), bucketSkipped},
+		{"new ready but terminating is skipped", newTestPod("new-terminating", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true), withDeletionTimestamp()), bucketSkipped},
+		{"new erroneous exit tracked as unhealthy", newTestPod("new-crash-looping", testNewHash, withPhase(corev1.PodRunning), withErroneousExit()), bucketNewUnhealthy},
 	}
 
 	r := _resource{expectationsStore: expect.NewExpectationsStore()}
@@ -71,6 +81,7 @@ func TestComputeUpdateWork(t *testing.T) {
 				bucketOldUncategorized: work.oldTemplateHashUncategorizedPods,
 				bucketOldReady:         work.oldTemplateHashReadyPods,
 				bucketNewReady:         work.newTemplateHashReadyPods,
+				bucketNewUnhealthy:     work.newTemplateHashUnhealthyPods,
 			}
 
 			bucketNames := map[bucket]string{
@@ -80,6 +91,7 @@ func TestComputeUpdateWork(t *testing.T) {
 				bucketOldUncategorized: "oldUncategorized",
 				bucketOldReady:         "oldReady",
 				bucketNewReady:         "newReady",
+				bucketNewUnhealthy:     "newUnhealthy",
 			}
 			for b, pods := range bucketPods {
 				name := bucketNames[b]
@@ -90,6 +102,112 @@ func TestComputeUpdateWork(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProcessPendingUpdatesWaitsForAllUpdatedPodsReady(t *testing.T) {
+	tests := []struct {
+		name            string
+		pods            []*corev1.Pod
+		wantRequeue     bool
+		wantReadyDetail string
+		wantStallEvent  bool
+	}{
+		{
+			name: "one of two updated pods ready, other crash-looping",
+			pods: []*corev1.Pod{
+				newTestPod("new-ready", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true)),
+				newTestPod("new-crash-looping", testNewHash, withPhase(corev1.PodRunning), withErroneousExit()),
+			},
+			wantRequeue:     true,
+			wantReadyDetail: "1 ready, need 2",
+			wantStallEvent:  true,
+		},
+		{
+			name: "ready but terminating replacement does not count as ready",
+			pods: []*corev1.Pod{
+				newTestPod("new-ready", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true)),
+				newTestPod("new-ready-terminating", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true), withDeletionTimestamp()),
+			},
+			wantRequeue:     true,
+			wantReadyDetail: "1 ready, need 2",
+		},
+		{
+			name: "all updated pods ready",
+			pods: []*corev1.Pod{
+				newTestPod("new-ready-0", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true)),
+				newTestPod("new-ready-1", testNewHash, withPhase(corev1.PodRunning), withReadyCondition(), withContainerStatus(ptr.To(true), true)),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pclq := &grovecorev1alpha1.PodClique{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pclq",
+					Namespace: testNS,
+				},
+				Spec: grovecorev1alpha1.PodCliqueSpec{
+					Replicas:     2,
+					MinAvailable: ptr.To[int32](1),
+				},
+				Status: grovecorev1alpha1.PodCliqueStatus{
+					UpdateProgress: &grovecorev1alpha1.PodCliqueUpdateProgress{
+						UpdateStartedAt:            metav1.Now(),
+						PodCliqueSetGenerationHash: "new-generation-hash",
+						PodTemplateHash:            testNewHash,
+					},
+				},
+			}
+			cl := testutils.SetupFakeClient(pclq)
+			recorder := record.NewFakeRecorder(10)
+			r := _resource{
+				client:            cl,
+				eventRecorder:     recorder,
+				expectationsStore: expect.NewExpectationsStore(),
+			}
+			sc := &syncContext{
+				ctx:                      context.Background(),
+				pclq:                     pclq,
+				existingPCLQPods:         tt.pods,
+				expectedPodTemplateHash:  testNewHash,
+				pclqExpectationsStoreKey: "test-key",
+			}
+
+			err := r.processPendingUpdates(logr.Discard(), sc)
+			updatedPCLQ := &grovecorev1alpha1.PodClique{}
+			require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+				Name: pclq.Name, Namespace: pclq.Namespace,
+			}, updatedPCLQ))
+
+			assert.Equal(t, tt.wantStallEvent, hasStallEvent(recorder), "stall event emission")
+
+			if tt.wantRequeue {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantReadyDetail)
+				assert.Nil(t, updatedPCLQ.Status.UpdateProgress.UpdateEndedAt)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, updatedPCLQ.Status.UpdateProgress.UpdateEndedAt)
+		})
+	}
+}
+
+// hasStallEvent drains the fake recorder and reports whether a RollingUpdateStalled event was emitted.
+func hasStallEvent(recorder *record.FakeRecorder) bool {
+	found := false
+	for {
+		select {
+		case ev := <-recorder.Events:
+			if strings.Contains(ev, constants.ReasonRollingUpdateStalled) {
+				found = true
+			}
+		default:
+			return found
+		}
 	}
 }
 
@@ -159,5 +277,6 @@ const (
 	bucketOldUncategorized
 	bucketOldReady
 	bucketNewReady
-	bucketSkipped // terminating pods — not in any bucket
+	bucketNewUnhealthy
+	bucketSkipped // terminating / untracked pods — not in any counted bucket
 )
