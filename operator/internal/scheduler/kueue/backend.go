@@ -50,6 +50,7 @@ const (
 	podSetRequiredTopologyAnnotation = "kueue.x-k8s.io/podset-required-topology"
 	isGroupWorkloadAnnotation        = "kueue.x-k8s.io/is-group-workload"
 	roleHashAnnotation               = "kueue.x-k8s.io/role-hash"
+	kueueAdmissionDisabledAnnotation = "grove.io/kueue-admission-disabled"
 )
 
 const podSetUnconstrainedTopologyAnnotation = "kueue.x-k8s.io/podset-unconstrained-topology"
@@ -224,6 +225,9 @@ func (b *schedulerBackend) buildPrebuiltWorkload(pcs *grovecorev1alpha1.PodCliqu
 		if cliqueTemplate == nil {
 			return nil, fmt.Errorf("no clique template found for PodGroup %q in PodCliqueSet %s/%s", podGroup.Name, pcs.Namespace, pcs.Name)
 		}
+		if kueueAdmissionDisabled(cliqueTemplate.Annotations) {
+			continue
+		}
 		podSpec, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&cliqueTemplate.Spec.PodSpec)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert pod spec for clique %q: %w", cliqueTemplate.Name, err)
@@ -275,6 +279,9 @@ func (b *schedulerBackend) buildPrebuiltWorkload(pcs *grovecorev1alpha1.PodCliqu
 			podSet["topologyRequest"] = map[string]any{"unconstrained": true}
 		}
 		podSets = append(podSets, podSet)
+	}
+	if len(podSets) == 0 {
+		return nil, fmt.Errorf("PodGang %s/%s has no PodGroups enabled for Kueue admission", podGang.Namespace, podGang.Name)
 	}
 
 	workload := newKueueWorkload(podGang.Namespace, podGang.Name)
@@ -357,6 +364,10 @@ func (b *schedulerBackend) PreparePod(pod *corev1.Pod, preparation scheduler.Pod
 	}
 
 	pod.Spec.SchedulerName = b.config.UnderlyingSchedulerName
+	if kueueAdmissionDisabled(preparation.PodClique.Annotations) {
+		delete(pod.Labels, queueNameLabel)
+		return nil
+	}
 	if pod.Labels == nil {
 		pod.Labels = make(map[string]string)
 	}
@@ -397,9 +408,16 @@ func podGangTotalPodCount(pcs *grovecorev1alpha1.PodCliqueSet, podGang *grovesch
 		if cliqueTemplate == nil {
 			return 0, fmt.Errorf("no clique template found for PodGroup %q in PodCliqueSet %s/%s", podGroup.Name, pcs.Namespace, pcs.Name)
 		}
+		if kueueAdmissionDisabled(cliqueTemplate.Annotations) {
+			continue
+		}
 		total += int(cliqueTemplate.Spec.Replicas)
 	}
 	return total, nil
+}
+
+func kueueAdmissionDisabled(annotations map[string]string) bool {
+	return annotations[kueueAdmissionDisabledAnnotation] == "true"
 }
 
 // ValidatePodCliqueSet rejects PodCliqueSets that cannot be represented as a valid Kueue Workload.
@@ -415,6 +433,9 @@ func (b *schedulerBackend) ValidatePodCliqueSet(_ context.Context, pcs *grovecor
 	)
 	for _, cliqueTemplate := range pcs.Spec.Template.Cliques {
 		if cliqueTemplate == nil {
+			continue
+		}
+		if kueueAdmissionDisabled(cliqueTemplate.Annotations) {
 			continue
 		}
 		minAvailable := cliqueTemplate.Spec.MinAvailable
