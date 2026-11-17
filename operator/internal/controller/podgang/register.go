@@ -62,7 +62,8 @@ func (r *Reconciler) RegisterWithManager(mgr ctrl.Manager) error {
 	// changes the PodGang generation, so watch the Workload and re-enqueue its owner to drive that cycle.
 	// Gated on the Kueue backend being registered so deployments without Kueue do not require its CRD to
 	// start the informer.
-	if r.schedRegistry.Get(string(configv1alpha1.SchedulerNameKueue)) != nil {
+	if r.schedRegistry.Get(string(configv1alpha1.SchedulerNameKueue)) != nil ||
+		r.schedRegistry.Get(string(configv1alpha1.SchedulerNameKueueDefault)) != nil {
 		ctrlBuilder = ctrlBuilder.Watches(
 			newKueueWorkloadType(),
 			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &groveschedulerv1alpha1.PodGang{}),

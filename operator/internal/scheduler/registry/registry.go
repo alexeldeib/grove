@@ -102,7 +102,7 @@ func newSchedulerBackend(cl, directClient client.Client, scheme *runtime.Scheme,
 		b = kube.New(cl, scheme, rec, p)
 	case configv1alpha1.SchedulerNameKai:
 		b = kai.New(cl, scheme, rec, p)
-	case configv1alpha1.SchedulerNameKueue:
+	case configv1alpha1.SchedulerNameKueue, configv1alpha1.SchedulerNameKueueDefault:
 		b = kueue.New(cl, scheme, rec, p)
 	case configv1alpha1.SchedulerNameVolcano:
 		b = volcano.New(cl, scheme, rec, p)

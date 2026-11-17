@@ -218,6 +218,18 @@ func TestValidateSchedulerConfiguration(t *testing.T) {
 			},
 			expectErrors: 0,
 		},
+		{
+			name: "valid: independent kueue and kueue-default profiles",
+			scheduler: &configv1alpha1.SchedulerConfiguration{
+				Profiles: []configv1alpha1.SchedulerProfile{
+					{Name: configv1alpha1.SchedulerNameKube},
+					{Name: configv1alpha1.SchedulerNameKueue},
+					{Name: configv1alpha1.SchedulerNameKueueDefault},
+				},
+				DefaultProfileName: string(configv1alpha1.SchedulerNameKube),
+			},
+			expectErrors: 0,
+		},
 		// single kai without kube → invalid because default-scheduler profile is always required
 		{
 			name: "invalid: single kai without kube profile",
