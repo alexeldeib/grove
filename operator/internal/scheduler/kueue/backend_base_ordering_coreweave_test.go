@@ -61,10 +61,11 @@ func addOrderingObjects(t *testing.T, cl client.Client, base *groveschedulerv1al
 func orderingTail(base *groveschedulerv1alpha1.PodGang) *groveschedulerv1alpha1.PodGang {
 	return &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: base.Namespace,
-			Name:      orderingTailGang,
-			UID:       "tail-podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: base.Labels[apicommon.LabelPartOfKey]},
+			Namespace:   base.Namespace,
+			Name:        orderingTailGang,
+			UID:         "tail-podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: orderingTailGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: base.Labels[apicommon.LabelPartOfKey]},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: orderingTailPclq, MinReplicas: 1}},
@@ -201,7 +202,7 @@ func TestBackendSyncPodGangBaseReleasesOnlyItsOwnReplica(t *testing.T) {
 
 	otherTail := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: base.Namespace, Name: "demo-1-w-0", UID: "other-tail-uid",
+			Namespace: base.Namespace, Name: "demo-1-w-0", UID: "other-tail-uid", Annotations: map[string]string{kueueWorkloadNameAnnotation: "demo-1-w-0"},
 			Labels: map[string]string{apicommon.LabelPartOfKey: base.Labels[apicommon.LabelPartOfKey]},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
@@ -222,7 +223,7 @@ func TestBackendSyncPodGangDoesNotGateSecondReplicaBase(t *testing.T) {
 	cl, backend, base, _ := newOrderingFixture(t, 0)
 	secondBase := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: base.Namespace, Name: "demo-1", UID: "second-base-uid",
+			Namespace: base.Namespace, Name: "demo-1", UID: "second-base-uid", Annotations: map[string]string{kueueWorkloadNameAnnotation: "demo-1"},
 			Labels: map[string]string{apicommon.LabelPartOfKey: base.Labels[apicommon.LabelPartOfKey]},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{

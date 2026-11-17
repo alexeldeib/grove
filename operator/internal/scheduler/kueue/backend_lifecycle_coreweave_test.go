@@ -94,7 +94,7 @@ func TestLifecycleMigrationEmptyLeaseAndMixedGroups(t *testing.T) {
 				}
 			}
 			b := backend.(*schedulerBackend)
-			mode, err := b.podGroupLifecycle(t.Context(), pg)
+			mode, err := b.podGroupLifecycle(t.Context(), pg, pg.Name)
 			if mixed {
 				require.ErrorContains(t, err, "mixed pod lifecycle modes")
 				assert.Empty(t, getTestWorkload(t, cl, pg.Namespace, pg.Name).GetAnnotations()[podGroupLifecycleAnnotation])
@@ -142,7 +142,7 @@ func TestLifecycleMigrationFailsClosed(t *testing.T) {
 			failing := lifecycleFailureClient{Client: cl, failure: failure}
 			b := New(failing, cl.Scheme(), record.NewFakeRecorder(10), configv1alpha1.SchedulerProfile{Name: configv1alpha1.SchedulerNameKueue}).(*schedulerBackend)
 			require.NoError(t, b.Init(failing))
-			mode, err := b.podGroupLifecycle(t.Context(), pg)
+			mode, err := b.podGroupLifecycle(t.Context(), pg, pg.Name)
 			require.Error(t, err)
 			assert.Empty(t, mode, "failed migration must not authorize pod creation")
 		})
@@ -200,13 +200,13 @@ func TestLifecycleUpdateConflictRetriesWithoutLosingConcurrentMetadata(t *testin
 	b := backend.(*schedulerBackend)
 	b.client = failing
 	require.NoError(t, b.Init(failing))
-	mode, err := b.podGroupLifecycle(t.Context(), pg)
+	mode, err := b.podGroupLifecycle(t.Context(), pg, pg.Name)
 	require.True(t, apierrors.IsConflict(err), "stale resource version must not authorize replacement")
 	assert.Empty(t, mode)
 	current := getTestWorkload(t, cl, pg.Namespace, pg.Name)
 	assert.Empty(t, current.GetAnnotations()[podGroupLifecycleAnnotation])
 	assert.Equal(t, "retained", current.GetAnnotations()["example.com/concurrent"])
-	mode, err = b.podGroupLifecycle(t.Context(), pg)
+	mode, err = b.podGroupLifecycle(t.Context(), pg, pg.Name)
 	require.NoError(t, err)
 	assert.Equal(t, podGroupLifecycleLegacy, mode)
 	current = getTestWorkload(t, cl, pg.Namespace, pg.Name)

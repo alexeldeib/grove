@@ -64,10 +64,11 @@ func TestBackendSyncPodGangTopologyGroupAndReconciliation(t *testing.T) {
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podGang,
-			Namespace: namespace,
-			UID:       "podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+			Name:        podGang,
+			Namespace:   namespace,
+			UID:         "podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: podGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: pcsName},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{
@@ -180,10 +181,11 @@ func TestBackendBuildPrebuiltWorkloadUnconstrainedTopology(t *testing.T) {
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podGang,
-			Namespace: namespace,
-			UID:       "podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+			Name:        podGang,
+			Namespace:   namespace,
+			UID:         "podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: podGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: pcsName},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{{
@@ -254,10 +256,11 @@ func TestBackendExcludesCliqueFromKueueAdmission(t *testing.T) {
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podGang,
-			Namespace: namespace,
-			UID:       "podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+			Name:        podGang,
+			Namespace:   namespace,
+			UID:         "podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: podGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: pcsName},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{
@@ -341,10 +344,11 @@ func TestBackendSyncPodGangIgnoresDefaultedEmptyTemplateMetadata(t *testing.T) {
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podGang,
-			Namespace: namespace,
-			UID:       "podgang-uid",
-			Labels:    map[string]string{apicommon.LabelPartOfKey: pcsName},
+			Name:        podGang,
+			Namespace:   namespace,
+			UID:         "podgang-uid",
+			Annotations: map[string]string{kueueWorkloadNameAnnotation: podGang},
+			Labels:      map[string]string{apicommon.LabelPartOfKey: pcsName},
 		},
 		Spec: groveschedulerv1alpha1.PodGangSpec{
 			PodGroups: []groveschedulerv1alpha1.PodGroup{{
@@ -412,7 +416,7 @@ func TestIndependentKueueProfiles(t *testing.T) {
 		}},
 	}
 	pg := &groveschedulerv1alpha1.PodGang{
-		ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default", UID: "gang", Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-0", Namespace: "default", UID: "gang", Labels: map[string]string{apicommon.LabelPartOfKey: "demo"}, Annotations: map[string]string{kueueWorkloadNameAnnotation: "demo-0"}},
 		Spec:       groveschedulerv1alpha1.PodGangSpec{PodGroups: []groveschedulerv1alpha1.PodGroup{{Name: "demo-0-worker", MinReplicas: 1}}},
 	}
 	cl := testutils.NewTestClientBuilder().WithObjects(pcs, pg).Build()

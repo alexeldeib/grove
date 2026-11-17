@@ -82,6 +82,8 @@ func TestProtectedReplicaFloorChangesPreserveLease(t *testing.T) {
 			pg.Name = "demo-0-worker-0"
 			pg.ResourceVersion = ""
 			pg.UID = "scaled-gang-uid"
+			// A new PodGang keeps its own name as the Workload identity, not the copied fixture's.
+			pg.Annotations[kueueWorkloadNameAnnotation] = pg.Name
 			require.NoError(t, cl.Create(ctx, pg))
 			require.NoError(t, backend.SyncPodGang(ctx, pg))
 			workload := getTestWorkload(t, cl, pg.Namespace, pg.Name)
